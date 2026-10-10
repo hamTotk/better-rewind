@@ -3,7 +3,9 @@ import type { Engine } from 'claude-code/testing'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import type { Branch, Point, SummarizeRequest } from '../types'
+import type { Unfinished } from '../types'
 import {
+  BUSY,
   branchLines,
   changesParts,
   clipToRows,
@@ -13,23 +15,28 @@ import {
   locatePoint,
   modeOptions,
   pointKey,
+  restoreLines,
+  shortNames,
   snapName,
   splitForSummary,
   summarizeRequest,
   summarizedMessage,
+  unfinishedMessage,
   windowAround,
 } from '../hooks/lib'
 
 const none = { files: [], added: 0, removed: 0 }
+// Restore code が戻すファイルが無い地点の restore
+const NOTHING = { total: 0, files: [], skippedTotal: 0, skipped: [] }
 const QUESTIONS = [
   { question: '次は?', header: '進め方', multiSelect: false, options: [{ label: 'A' }, { label: 'B', description: 'B の説明' }] },
   { question: '色は?', multiSelect: false, options: [{ label: '赤' }, { label: '青' }] },
 ]
 // 一覧に出る地点は人の発言と AskUserQuestion の質問だけ (helper の points() と同じ)
 const POINTS: Point[] = [
-  { uuid: 'u1', kind: 'prompt', label: '色を聞いて', text: '色を聞いて', reply: '聞きます', changes: { files: ['C:\\x\\foo.ts', 'C:\\x\\bar.ts'], added: 12, removed: 3 }, canCut: true, restorable: false },
-  { uuid: 'u2', kind: 'prompt', label: 'foo を直して', text: 'foo を直して', reply: '▸ Edit foo.ts\n直しました', changes: { files: ['C:\\x\\foo.ts'], added: 3, removed: 1 }, canCut: true, restorable: true },
-  { uuid: 'a4', kind: 'tool', tool: 'AskUserQuestion', toolUseId: 't2', label: 'AskUserQuestion 次は?', reply: '▸ AskUserQuestion 次は?', questions: QUESTIONS, changes: none, canCut: true, restorable: false },
+  { uuid: 'u1', kind: 'prompt', label: '色を聞いて', text: '色を聞いて', reply: '聞きます', changes: { files: ['C:\\x\\foo.ts', 'C:\\x\\bar.ts'], added: 12, removed: 3 }, canCut: true, restorable: false, restore: NOTHING },
+  { uuid: 'u2', kind: 'prompt', label: 'foo を直して', text: 'foo を直して', reply: '▸ Edit foo.ts\n直しました', changes: { files: ['C:\\x\\foo.ts'], added: 3, removed: 1 }, canCut: true, restorable: true, restore: { total: 1, files: [{ path: 'C:\\x\\foo.ts', action: 'write' }], skippedTotal: 0, skipped: [] } },
+  { uuid: 'a4', kind: 'tool', tool: 'AskUserQuestion', toolUseId: 't2', label: 'AskUserQuestion 次は?', reply: '▸ AskUserQuestion 次は?', questions: QUESTIONS, changes: none, canCut: true, restorable: false, restore: NOTHING },
 ]
 const BRANCHES: Branch[] = [
   { id: '2026-10-10T05-03-00-000Z', at: '2026-10-10T05:03:00.000Z', label: 'foo を直して', mode: 'both', answered: false, text: '❯ foo を直して\n\n▸ Edit foo.ts\n\n直しました\n\n❯ 次\n\nはい' },
@@ -68,11 +75,16 @@ const PANE = {
 
 const REWOUND = { file: 'S.jsonl', id: 'b1', mode: 'conversation', leaf: 'x', dropped: 3, restored: [], removed: [] }
 
+// node の返事の代わりに置くと、その呼び出しを拒ませる (helper が起動できない・時間切れ)
+const REJECT = Symbol('reject')
+
 // エンジン側の受け口をまとめて用意する。node の各サブコマンドの返事を replies で渡し、呼ばれた内容を記録する
 function engine(on: On, replies: Record<string, unknown>, $test?: Engine) {
   mock.store(on)
   const seen = {
     node: [] as { sub: string; stdin?: string }[],
+    // node を呼んだときの時間切れ (ms)
+    timeouts: [] as (number | undefined)[],
     closed: [] as string[],
     toasts: [] as string[],
     commands: [] as string[],
@@ -95,6 +107,8 @@ function engine(on: On, replies: Record<string, unknown>, $test?: Engine) {
   on('process.run', ($, e) => {
     const sub = e.argv[2] ?? ''
     seen.node.push({ sub, stdin: e.init?.stdin })
+    seen.timeouts.push(e.init?.timeoutMs)
+    if (replies[sub] === REJECT) throw new Error('timed out')
     return { value: done(JSON.stringify(replies[sub] ?? { error: `no reply: ${sub}` })) }
   })
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
@@ -313,7 +327,7 @@ describe('巻き戻しの実行', () => {
 
     await $.turn.start({ text: '', turnId: 'T1' })
     await ui.press({ key: pointKey(POINTS[0]!) })
-    expect(seen.toasts.at(-1)).toBe('Cannot rewind while the AI is responding. Try again when it finishes')
+    expect(seen.toasts.at(-1)).toBe('Cannot rewind while Claude is responding. Try again when it finishes')
     expect(await ui.find({ type: 'Text', text: 'Restore the code and/or conversation to the point before…' })).toBeDefined()
 
     await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'T1', reason: 'answer' })
@@ -322,7 +336,7 @@ describe('巻き戻しの実行', () => {
     await $.turn.start({ text: '', turnId: 'T2' })
     await ui.press({ key: 'mode:conversation' })
     expect(rewinds(seen)).toEqual([])
-    expect(await ui.find({ type: 'Text', text: 'Cannot rewind while the AI is responding. Try again when it finishes' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Cannot rewind while Claude is responding. Try again when it finishes' })).toBeDefined()
     expect(seen.commands).toEqual([])
   })
 
@@ -424,7 +438,7 @@ describe('要約', () => {
     const ui = await toSummarize($, POINTS[1]!, 'mode:summarize')
     await ui.press({ key: 'summarize:now' })
     expect(seen.commands).toEqual(['/compact '])
-    expect(seen.toasts.at(-1)).toBe('Could not summarize from this point: /compact did not reach better-rewind (it may have summarized the whole conversation)')
+    expect(seen.toasts.at(-1)).toBe('Could not summarize from this point: the summary did not go through better-rewind, so it may have covered the whole conversation. Scroll up to check it')
     expect(seen.statuses).toEqual(['Summarizing…', undefined])
   })
 
@@ -478,14 +492,14 @@ describe('要約', () => {
     await ui.press({ key: 'mode:summarize' })
     await $.turn.start({ text: '', turnId: 'T1' })
     await ui.input({ key: 'summarize:context', text: 'x' })
-    expect(seen.toasts.at(-1)).toBe('Cannot rewind while the AI is responding. Try again when it finishes')
+    expect(seen.toasts.at(-1)).toBe('Cannot summarize while Claude is responding. Try again when it finishes')
     expect(seen.compacts).toEqual([])
     expect(seen.closed).toEqual([])
   })
 })
 
 describe('要約の位置', () => {
-  const prompt = (uuid: string, text: string | undefined): Point => ({ uuid, kind: 'prompt', label: text ?? '/model', text, reply: '', changes: none, canCut: true, restorable: false })
+  const prompt = (uuid: string, text: string | undefined): Point => ({ uuid, kind: 'prompt', label: text ?? '/model', text, reply: '', changes: none, canCut: true, restorable: false, restore: NOTHING })
   // 同じ本文の発言「続けて」が 2 回ある一覧
   const LIST = [prompt('p1', '続けて'), prompt('p2', '直して'), prompt('p3', '続けて'), POINTS[2]!]
 
@@ -561,7 +575,7 @@ describe('ファイルの控え', () => {
     })
     on('tool.call', () => {
       ran++
-      return { deny: 'テストでは実行しない' }
+      return { result: 'ok' }
     })
 
     await $.tool.call({ tool: 'Edit', file_path: 'C:/x/a.ts', old_string: 'x', new_string: 'y' })
@@ -570,10 +584,12 @@ describe('ファイルの控え', () => {
     await $.tool.call({ tool: 'Write', file_path: 'C:/x/big.bin', content: 'n' })
     expect(ran).toBe(4)
 
-    const metas = [...writes].filter(([p]) => p.endsWith('.json')).map(([p, t]) => ({ p, meta: JSON.parse(t) as { toolUseId: string; tool: string; path: string; existed: boolean; data?: string } }))
-    expect(metas.map(m => [m.meta.tool, m.meta.path, m.meta.existed])).toEqual([
-      ['Edit', 'C:/x/a.ts', true],
-      ['Write', 'C:/x/new.md', false],
+    const metas = [...writes].filter(([p]) => p.endsWith('.json')).map(([p, t]) => ({ p, meta: JSON.parse(t) as { toolUseId: string; tool: string; path: string; existed: boolean; data?: string; state: string } }))
+    // 実行された呼び出しの控えは ran。大きいファイルの情報も、node が書いた後で ran に書き直す
+    expect(metas.map(m => [m.meta.tool, m.meta.path, m.meta.existed, m.meta.state])).toEqual([
+      ['Edit', 'C:/x/a.ts', true, 'ran'],
+      ['Write', 'C:/x/new.md', false, 'ran'],
+      ['Write', 'C:/x/big.bin', true, 'ran'],
     ])
     for (const { p, meta } of metas) expect(p).toBe(`C:/rd/snaps/${snapName(meta.toolUseId)}.json`)
     const edit = metas[0]!.meta
@@ -591,6 +607,7 @@ describe('ファイルの控え', () => {
     on('session.id', () => ({ value: 'S' }))
     on('process.run', () => ({ value: done(JSON.stringify({ error: 'boom' }), 1) }))
     on('ui.log', () => ({ value: undefined }))
+    on('ui.toast', () => ({ value: undefined }))
     on('tool.call', () => {
       ran++
       return { deny: 'テストでは実行しない' }
@@ -599,9 +616,11 @@ describe('ファイルの控え', () => {
     expect(ran).toBe(1)
   })
 
-  test('stat が「無い」以外の理由で失敗したら、「無かった」と控えずにログだけ残す', async ($, on) => {
+  test('stat が「無い」以外の理由で失敗したら、「無かった」と控えず、控えの失敗の印を残して知らせる', async ($, on) => {
     mock.store(on)
     const writes: string[] = []
+    const texts: string[] = []
+    const toasts: string[] = []
     const logs: string[] = []
     on('session.id', () => ({ value: 'S' }))
     on('process.run', () => ({ value: done(JSON.stringify({ dir: 'C:/rd' })) }))
@@ -611,15 +630,23 @@ describe('ファイルの控え', () => {
     on('fs.exists', () => ({ value: true }))
     on('fs.write', ($, e) => {
       writes.push(e.path)
+      texts.push(e.text)
       return { value: undefined }
     })
     on('ui.log', ($, e) => {
       logs.push(String(e.text))
       return { value: undefined }
     })
+    on('ui.toast', ($, e) => {
+      toasts.push(String(e.text))
+      return { value: undefined }
+    })
     on('tool.call', () => ({ deny: 'テストでは実行しない' }))
     await $.tool.call({ tool: 'Write', file_path: 'C:/x/locked.md', content: 'n' })
-    expect(writes).toEqual([])
+    // 書くのは控えの情報 (失敗の印) だけ。中身も「無かった」という控えも書かない
+    expect(writes.filter(p => !p.endsWith('.json'))).toEqual([])
+    expect(JSON.parse(texts.at(-1) ?? '{}') as unknown).toMatchObject({ path: 'C:/x/locked.md', existed: false, failed: true })
+    expect(toasts).toEqual([expect.stringContaining('could not back up C:/x/locked.md')])
     expect(logs).toHaveLength(1)
     expect(logs[0]).toContain('could not back up C:/x/locked.md')
   })
@@ -690,7 +717,7 @@ describe('表示の計算', () => {
     expect(summarizedMessage('from', { kind: 'done' })).toBe('Summarized from here')
     expect(summarizedMessage('up_to', { kind: 'done' })).toBe('Summarized up to here')
     expect(summarizedMessage('from', { kind: 'skip', reason: 'nope' })).toBe('Not summarized: nope')
-    expect(summarizedMessage('up_to', null)).toMatch(/^Could not summarize from this point: \/compact did not reach better-rewind/)
+    expect(summarizedMessage('up_to', null)).toMatch(/^Could not summarize from this point: the summary did not go through better-rewind, so it may have covered the whole conversation/)
   })
 
   test('doneMessage・branchLines・editedFile', () => {
@@ -704,5 +731,280 @@ describe('表示の計算', () => {
     expect(isMissing(Object.assign(new Error('no such file'), { code: 'ENOENT' }))).toBe(true)
     expect(isMissing(new Error("ENOENT: no such file or directory, stat 'C:/x'"))).toBe(true)
     expect(isMissing(new Error('EACCES: permission denied'))).toBe(false)
+  })
+})
+
+describe('レビューの指摘への対応', () => {
+  // POINTS[1] に、helper の計画 (fileRestorePlan) で後の発言の分も含めた戻すファイルを持たせる
+  const WIDE: Point = {
+    ...POINTS[1]!,
+    restore: { total: 7, files: [{ path: 'C:\\x\\foo.ts', action: 'write' }, { path: 'C:\\x\\n.md', action: 'delete' }], skippedTotal: 1, skipped: ['C:\\x\\bar.ts'] },
+  }
+
+  test('Restore code の確認画面には、helper の計画と同じ戻すファイル (件数と名前) と戻さないファイルが出る。選択肢の並びは変わらない', async ($, on) => {
+    engine(on, { points: { points: [POINTS[0]!, WIDE, POINTS[2]!] } })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: "── Claude's reply from this point" })).toBeDefined()
+    await ui.press({ key: pointKey(WIDE) })
+    expect(await ui.find({ type: 'Text', text: 'Restore code puts back 7 files changed after this point, including by later prompts:' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /foo\.ts/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /n\.md \(deleted: it did not exist at this point\)/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /…and 5 more/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Not restored, because no backup could be taken before an edit: bar.ts' })).toBeDefined()
+    expect((await ui.findAll({ type: 'Button' })).map(b => b.props.key)).toEqual(['mode:both', 'mode:conversation', 'mode:files', 'mode:summarize', 'mode:summarize_up_to', 'mode:cancel'])
+  })
+
+  test('戻さなかったファイルがあれば、終わったときの知らせに名前を出す', async ($, on) => {
+    const seen = engine(on, { points: { points: [POINTS[0]!, WIDE, POINTS[2]!] }, rewind: { ...REWOUND, mode: 'files', restored: ['C:/x/foo.ts'], removed: [], skipped: ['C:/x/bar.ts'] } })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: pointKey(WIDE) })
+    await ui.press({ key: 'mode:files' })
+    expect(seen.toasts.at(-1)).toBe('Code restored · 1 file · not restored (no backup): bar.ts')
+  })
+
+  test('helper が答えなかったら (時間切れなど)、会話を戻す巻き戻しでは読み直し、終わったか分からないと知らせる', async ($, on) => {
+    const seen = engine(on, { points: { points: POINTS }, rewind: REJECT })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: pointKey(POINTS[0]!) })
+    await ui.press({ key: 'mode:conversation' })
+    // 書き込みの途中で打ち切られないよう、巻き戻しの時間切れは上限の 10 分
+    expect(seen.timeouts.at(-1)).toBe(600_000)
+    expect(seen.closed).toEqual(['better-rewind'])
+    expect(seen.commands).toEqual(['/resume S'])
+    // 終わったか分からないので、発言は入力欄に戻さない
+    expect(seen.filled).toEqual([])
+    expect(seen.toasts.at(-1)).toMatch(/^The rewind may not have finished: it stopped before reporting back \(for example, because it ran longer than 10 minutes\)\. The conversation was reloaded in case it changed\./)
+  })
+
+  test('ファイルだけ戻すときに helper が答えなければ、読み直さずに知らせる', async ($, on) => {
+    const seen = engine(on, { points: { points: POINTS }, rewind: REJECT })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: pointKey(POINTS[1]!) })
+    await ui.press({ key: 'mode:files' })
+    expect(seen.commands).toEqual([])
+    expect(seen.toasts.at(-1)).toMatch(/^The rewind may not have finished: /)
+    expect(seen.toasts.at(-1)).not.toMatch(/reloaded/)
+  })
+
+  test('一覧を読むときに helper が動かなくても、Loading のまま止まらず理由を出す', async ($, on) => {
+    engine(on, { points: REJECT })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: /^Could not load: better-rewind's helper did not finish/ })).toBeDefined()
+  })
+
+  test('前に途中で打ち切られた巻き戻しがあれば、一覧を開いたときに場所つきで知らせる', async ($, on) => {
+    const u: Unfinished = { id: 'r1', at: '2026-10-10T05:03:00.000Z', label: 'foo を直して', files: ['C:\\x\\foo.ts'], saved: 'C:/rd/branches/r1.files', details: 'C:/rd/branches/r1.json' }
+    const seen = engine(on, { points: { points: POINTS, unfinished: [u] } })
+    await $.command.run(run('better-rewind'))
+    expect(seen.toasts.at(-1)).toBe(
+      'A rewind to "foo を直して" was stopped before it finished. foo.ts may be only partly restored; their contents from before the rewind are in C:/rd/branches/r1.files (C:/rd/branches/r1.json lists which file is which)',
+    )
+  })
+
+  test('subagent の応答終了 (agentId あり) では断るのをやめず、メインの応答終了でやめる', async ($, on) => {
+    const seen = engine(on, { points: { points: POINTS }, rewind: REWOUND })
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }))
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+
+    await $.turn.start({ text: '', turnId: 'T1' })
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'S1', reason: 'answer', agentId: 'sub1' })
+    await ui.press({ key: pointKey(POINTS[0]!) })
+    expect(seen.toasts.at(-1)).toBe(BUSY)
+    expect(rewinds(seen)).toEqual([])
+
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'T1', reason: 'answer' })
+    await ui.press({ key: pointKey(POINTS[0]!) })
+    await ui.press({ key: 'mode:conversation' })
+    expect(rewinds(seen)).toHaveLength(1)
+  })
+
+  test('拒否・失敗したツール呼び出しの控えは戻す対象から外し (denied)、中身を消す。実行された呼び出しの控えは ran にする', async ($, on) => {
+    mock.store(on)
+    const writes = new Map<string, string>()
+    const nodeCalls: string[][] = []
+    on('session.id', () => ({ value: 'S' }))
+    on('process.run', ($, e) => {
+      nodeCalls.push([...e.argv.slice(2)])
+      return { value: done(JSON.stringify(e.argv[2] === 'dir' ? { dir: 'C:/rd' } : { toolUseId: 'x' })) }
+    })
+    on('fs.stat', ($, e) => {
+      const isBig = e.path.replace(/\\/g, '/') === 'C:/x/big.bin'
+      return { value: { kind: 'file' as const, size: isBig ? 5 * 1024 * 1024 : 1, mtimeMs: 0, isLink: false } }
+    })
+    on('fs.read', () => ({ value: { base64: 'c2VjcmV0' } }))
+    on('fs.write', ($, e) => {
+      writes.set(e.path.replace(/\\/g, '/'), e.text)
+      return { value: undefined }
+    })
+    // エンジンの代わり: 人が拒否した呼び出し・失敗した呼び出し・実行された呼び出し
+    on('tool.call', ($, e) => {
+      const file = (e as unknown as { file_path?: string }).file_path
+      if (file === 'C:/x/denied.env' || file === 'C:/x/big.bin') return { deny: '人が拒否した' }
+      if (file === 'C:/x/failed.ts') return { isError: true as const, result: 'old_string not found', text: 'old_string not found' }
+      return { result: 'ok' }
+    })
+
+    await $.tool.call({ tool: 'Write', file_path: 'C:/x/denied.env', content: 'n' })
+    await $.tool.call({ tool: 'Edit', file_path: 'C:/x/failed.ts', old_string: 'x', new_string: 'y' })
+    await $.tool.call({ tool: 'Edit', file_path: 'C:/x/ok.ts', old_string: 'x', new_string: 'y' })
+    await $.tool.call({ tool: 'Write', file_path: 'C:/x/big.bin', content: 'n' })
+
+    const metas = [...writes].filter(([p]) => p.endsWith('.json')).map(([, t]) => JSON.parse(t) as { path: string; state: string; data?: string })
+    expect(metas.map(m => [m.path, m.state, m.data])).toEqual([
+      ['C:/x/denied.env', 'denied', undefined],
+      ['C:/x/failed.ts', 'denied', undefined],
+      ['C:/x/ok.ts', 'ran', expect.stringMatching(/\.b64$/)],
+      ['C:/x/big.bin', 'denied', undefined],
+    ])
+    // 拒否・失敗したファイルの中身は控えに残さない
+    expect([...writes].filter(([p]) => p.endsWith('.b64')).map(([, t]) => t)).toEqual(['', '', 'c2VjcmV0'])
+    // 大きいファイルの控え (node が写した) は node に消させる
+    expect(nodeCalls.filter(a => a[0] === 'drop').map(a => a.slice(1))).toEqual([['S', expect.any(String)]])
+  })
+
+  test('控えに失敗したら知らせ、「控えが無い」印を残す (実行されたら ran)', async ($, on) => {
+    mock.store(on)
+    const writes = new Map<string, string>()
+    const toasts: string[] = []
+    on('session.id', () => ({ value: 'S' }))
+    on('process.run', () => ({ value: done(JSON.stringify({ dir: 'C:/rd' })) }))
+    on('fs.stat', () => ({ value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }))
+    on('fs.read', () => {
+      throw new Error('EBUSY: resource busy or locked')
+    })
+    on('fs.write', ($, e) => {
+      writes.set(e.path.replace(/\\/g, '/'), e.text)
+      return { value: undefined }
+    })
+    on('ui.log', () => ({ value: undefined }))
+    on('ui.toast', ($, e) => {
+      toasts.push(String(e.text))
+      return { value: undefined }
+    })
+    on('tool.call', () => ({ result: 'ok' }))
+    await $.tool.call({ tool: 'Edit', file_path: 'C:/x/a.ts', old_string: 'x', new_string: 'y' })
+    expect(toasts).toEqual(['better-rewind could not back up C:/x/a.ts before Edit changed it, so Restore code cannot bring back its earlier contents'])
+    const metas = [...writes].filter(([p]) => p.endsWith('.json')).map(([, t]) => JSON.parse(t) as unknown)
+    expect(metas).toEqual([expect.objectContaining({ path: 'C:/x/a.ts', failed: true, state: 'ran' })])
+  })
+
+  test('restoreLines・unfinishedMessage・doneMessage (戻さなかったファイル)', () => {
+    expect(restoreLines({ total: 0, files: [], skippedTotal: 0, skipped: [] })).toEqual({ lead: 'Restore code has nothing to put back from this point', files: [], skipped: undefined })
+    expect(restoreLines({ total: 1, files: [{ path: '/a/b.md', action: 'write' }], skippedTotal: 7, skipped: ['C:\\x\\c.ts'] })).toEqual({
+      lead: 'Restore code puts back 1 file changed after this point, including by later prompts:',
+      files: ['b.md'],
+      skipped: 'Not restored, because no backup could be taken before an edit: c.ts and 6 more',
+    })
+    expect(unfinishedMessage([])).toBeUndefined()
+    expect(doneMessage('files', { restored: ['a'], removed: [], skipped: ['C:/x/b.ts'] })).toBe('Code restored · 1 file · not restored (no backup): b.ts')
+  })
+})
+
+describe('2 周目の指摘への対応', () => {
+  test('拒否・失敗の結果でもファイルが控えから変わっていれば (実行後に断られた・途中で止まった)、控えを ran にして中身を残す。変わっていなければ denied', async ($, on) => {
+    mock.store(on)
+    const writes = new Map<string, string>()
+    const reads = new Map<string, number>()
+    let created = false
+    on('session.id', () => ({ value: 'S' }))
+    on('process.run', ($, e) => ({ value: done(JSON.stringify(e.argv[2] === 'dir' ? { dir: 'C:/rd' } : {})) }))
+    on('fs.stat', ($, e) => {
+      if (e.path.replace(/\\/g, '/') === 'C:/x/new.ts') throw new Error('ENOENT')
+      return { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
+    })
+    // new.ts は控えを取る時には無く、途中で止まった呼び出しが作った
+    on('fs.exists', ($, e) => ({ value: e.path.replace(/\\/g, '/') === 'C:/x/new.ts' ? created : true }))
+    // a.ts は 2 回目に読むと中身が変わっている (後段の hook が実行後に断った)。same.ts は変わらない
+    on('fs.read', ($, e) => {
+      const p = e.path.replace(/\\/g, '/')
+      const n = (reads.get(p) ?? 0) + 1
+      reads.set(p, n)
+      return { value: { base64: p === 'C:/x/a.ts' ? (n === 1 ? 'b2xk' : 'bmV3') : 'c2FtZQ==' } }
+    })
+    on('fs.write', ($, e) => {
+      writes.set(e.path.replace(/\\/g, '/'), e.text)
+      return { value: undefined }
+    })
+    on('tool.call', ($, e) => {
+      const file = (e as unknown as { file_path?: string }).file_path
+      if (file === 'C:/x/a.ts') return { deny: '後段の hook が実行後に断った' }
+      if (file === 'C:/x/new.ts') {
+        created = true
+        return { isError: true as const, result: 'interrupted', text: 'interrupted' }
+      }
+      return { deny: '人が拒否した' }
+    })
+
+    await $.tool.call({ tool: 'Edit', file_path: 'C:/x/a.ts', old_string: 'x', new_string: 'y' })
+    await $.tool.call({ tool: 'Write', file_path: 'C:/x/new.ts', content: 'n' })
+    await $.tool.call({ tool: 'Edit', file_path: 'C:/x/same.ts', old_string: 'x', new_string: 'y' })
+
+    const metas = [...writes].filter(([p]) => p.endsWith('.json')).map(([, t]) => JSON.parse(t) as { path: string; state: string; existed: boolean; data?: string })
+    expect(metas.map(m => [m.path, m.state, m.existed, m.data])).toEqual([
+      ['C:/x/a.ts', 'ran', true, expect.stringMatching(/\.b64$/)],
+      ['C:/x/new.ts', 'ran', false, undefined],
+      ['C:/x/same.ts', 'denied', true, undefined],
+    ])
+    // 変わったファイルの控えの中身は残し (戻すときに使う)、変わっていないファイルの中身は消す
+    expect([...writes].filter(([p]) => p.endsWith('.b64')).map(([, t]) => t)).toEqual(['b2xk', ''])
+  })
+
+  test('ファイルだけ戻した後で終わった印を書けなかったら、失敗とは言わずに、戻した件数と一緒に知らせる', async ($, on) => {
+    const error = 'The rewind finished, but could not record that it finished: C:/rd/branches/b1.json (disk is full). If /better-rewind later says this rewind was stopped before it finished, you can ignore that'
+    const seen = engine(on, { points: { points: POINTS }, rewind: { ...REWOUND, mode: 'files', restored: ['C:/x/foo.ts'], removed: [], skipped: [], transcriptChanged: false, error } })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: pointKey(POINTS[1]!) })
+    await ui.press({ key: 'mode:files' })
+    expect(seen.commands).toEqual([])
+    expect(seen.toasts.at(-1)).toBe(`Code restored · 1 file. ${error}`)
+  })
+
+  test('会話を戻した後で終わった印を書けなかったら (helper の実際の失敗の形)、読み直してから知らせ、発言は入力欄に戻さない', async ($, on) => {
+    const error = 'The rewind finished, but could not record that it finished: C:/rd/branches/b1.json (disk is full). If /better-rewind later says this rewind was stopped before it finished, you can ignore that'
+    const seen = engine(on, { points: { points: POINTS }, rewind: { ...REWOUND, skipped: [], transcriptChanged: true, error } })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: pointKey(POINTS[0]!) })
+    await ui.press({ key: 'mode:conversation' })
+    expect(seen.commands).toEqual(['/resume S'])
+    expect(seen.filled).toEqual([])
+    expect(seen.toasts.at(-1)).toBe(`The conversation was rewound and reloaded, but part of it failed: ${error}`)
+  })
+
+  test('helper が答えなかったときの知らせには、内部の言葉や生のエラー文を出さない', async ($, on) => {
+    const seen = engine(on, { points: { points: POINTS }, rewind: REJECT })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: pointKey(POINTS[0]!) })
+    await ui.press({ key: 'mode:conversation' })
+    expect(seen.toasts.at(-1)).toMatch(/longer than 10 minutes/)
+    expect(seen.toasts.at(-1)).not.toMatch(/helper|timed out|Error/)
+  })
+
+  test('shortNames・restoreLines: 同じ名前のファイルは、見分けられるまで親フォルダを添える', () => {
+    expect(shortNames(['C:\\x\\src\\a.ts', 'C:\\x\\test\\a.ts', '/b/c.md'])).toEqual(['src/a.ts', 'test/a.ts', 'c.md'])
+    expect(
+      restoreLines({
+        total: 2,
+        files: [
+          { path: 'C:\\x\\src\\a.ts', action: 'write' },
+          { path: 'C:\\x\\lib\\a.ts', action: 'delete' },
+        ],
+        skippedTotal: 1,
+        skipped: ['C:\\y\\src\\a.ts'],
+      }),
+    ).toEqual({
+      lead: 'Restore code puts back 2 files changed after this point, including by later prompts:',
+      files: ['x/src/a.ts', 'lib/a.ts (deleted: it did not exist at this point)'],
+      skipped: 'Not restored, because no backup could be taken before an edit: y/src/a.ts',
+    })
   })
 })

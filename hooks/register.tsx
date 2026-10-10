@@ -1,10 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { Branch, Mode, Point, RewindResult, View } from '../types'
+import type { Branch, Mode, Point, RewindResult, Snap, Unfinished, View } from '../types'
 import type { OptionKey } from './lib'
 import {
   BUSY,
+  BUSY_SUMMARIZE,
   branchLines,
   changesParts,
   clipToRows,
@@ -15,10 +16,12 @@ import {
   modeOptions,
   plural,
   pointKey,
+  restoreLines,
   snapName,
   splitForSummary,
   summarizeRequest,
   summarizedMessage,
+  unfinishedMessage,
   windowAround,
 } from './lib'
 
@@ -32,7 +35,7 @@ import {
 // $.session.compact は呼ばない: 呼んだ mod 自身の session.compact hook が飛ばされ、会話全体が要約される
 // (2026-10-10 実機で確認)。/compact を経由すると hook が trigger 'manual' で呼ばれ、要約が終わってから戻る。
 // /better-rewind branches は巻き戻す前の会話を読むだけの一覧。
-// Edit / Write / NotebookEdit の直前には tool.call で対象ファイルの控えを取る
+// Edit / Write / NotebookEdit の直前には tool.call で対象ファイルの控えを取り、ツールが実行されたかを控えに書き足す
 
 const PANE = 'better-rewind'
 // 一覧の最後の「(現在)」の key。選ぶと巻き戻さずに閉じる
@@ -77,25 +80,45 @@ const isRunning = atom({ plugin: 'better-rewind', key: 'isRunning' } as const, f
 
 type Ui = Elements[RenderSurface]
 
-// bin/transcript.mjs を呼んで、最後の行の JSON を返す。読めなければ error に理由を入れる
-async function node<T>($: EngineInterface, args: string[], stdin?: string): Promise<Partial<T> & { error?: string }> {
-  const r = await $.process.run(['node', `${$.plugin.root}/bin/transcript.mjs`, ...args], { timeoutMs: 60_000, ...(stdin === undefined ? {} : { stdin }) })
+// node の呼び出しの既定の時間切れ。巻き戻しは書き込みの途中で打ち切られないよう、$.process.run の上限 (10 分) にする
+const NODE_TIMEOUT = 60_000
+const REWIND_TIMEOUT = 600_000
+
+type NodeOut<T> = Partial<T> & {
+  error?: string
+  // helper が答えを返さなかった (起動できない・時間切れ・読めない出力)。途中まで進んだかもしれない
+  isUnknown?: true
+}
+
+// bin/transcript.mjs を呼んで、最後の行の JSON を返す。helper が答えなければ error に理由を入れ、isUnknown を立てる (reject しない)
+async function node<T>($: EngineInterface, args: string[], stdin?: string, timeoutMs = NODE_TIMEOUT): Promise<NodeOut<T>> {
+  let r: Awaited<ReturnType<EngineInterface['process']['run']>>
   try {
-    return JSON.parse(r.stdout.trim().split('\n').at(-1) || '{}') as Partial<T> & { error?: string }
-  } catch {
-    return { error: r.stderr.slice(0, 120) || 'Could not read the result' } as Partial<T> & { error?: string }
+    r = await $.process.run(['node', `${$.plugin.root}/bin/transcript.mjs`, ...args], { timeoutMs, ...(stdin === undefined ? {} : { stdin }) })
+  } catch (err) {
+    return { error: `better-rewind's helper did not finish (${String(err)})`, isUnknown: true } as NodeOut<T>
   }
+  try {
+    const out = JSON.parse(r.stdout.trim().split('\n').at(-1) || '') as NodeOut<T>
+    if (out && typeof out === 'object') return out
+  } catch {
+    // 下で読めない答えとして扱う
+  }
+  return { error: `better-rewind's helper gave no answer${r.stderr ? ` (${r.stderr.trim().slice(0, 120)})` : ''}`, isUnknown: true } as NodeOut<T>
 }
 
 async function loadPoints($: EngineInterface): Promise<Point[]> {
   await update($, status, () => 'Loading…')
-  const out = await node<{ points: Point[] }>($, ['points', await $.session.id()])
+  const out = await node<{ points: Point[]; unfinished: Unfinished[] }>($, ['points', await $.session.id()])
   if (!out.points) {
     await update($, status, () => `Could not load: ${out.error ?? ''}`)
     return []
   }
   await update($, points, () => out.points ?? [])
-  await update($, status, () => '')
+  // 前に途中で打ち切られた巻き戻しがあれば 1 度だけ知らせる (helper が知らせた印を付ける)
+  const warning = unfinishedMessage(out.unfinished ?? []) ?? ''
+  await update($, status, () => warning)
+  if (warning) $.ui.toast(warning, LONG_TOAST)
   return out.points
 }
 
@@ -113,12 +136,15 @@ async function closePane($: EngineInterface) {
   await $.ui.close({ id: PANE })
 }
 
-async function refuseWhileRunning($: EngineInterface): Promise<boolean> {
+async function refuseWhileRunning($: EngineInterface, message = BUSY): Promise<boolean> {
   if (!(await read($, isRunning))) return false
-  await update($, status, () => BUSY)
-  $.ui.toast(BUSY)
+  await update($, status, () => message)
+  $.ui.toast(message)
   return true
 }
+
+// 長い知らせ (ファイルの場所を含むもの) は読めるだけの間出しておく
+const LONG_TOAST = { timeoutMs: 15_000 }
 
 // Enter で地点を選んだとき。(現在) なら閉じる。それ以外は戻し方の段階へ (選べるのが「やめる」だけの地点は断る)
 async function choose($: EngineInterface, p: Point | undefined) {
@@ -154,7 +180,7 @@ async function pickMode($: EngineInterface, p: Point, m: OptionKey) {
 // 要約に添える指示を受けて (空でもよい)、ペインを閉じて /compact を動かす。どこで分けるかは session.compact の hook が
 // pending を読んで決め、どうしたかを outcome に残す。終わったらそれを読んで知らせる。ファイルには触れず、枝も残さない
 async function summarize($: EngineInterface, p: Point, context: string) {
-  if (await refuseWhileRunning($)) return
+  if (await refuseWhileRunning($, BUSY_SUMMARIZE)) return
   const d = await read($, direction)
   const request = d ? summarizeRequest(p, await read($, points), d) : undefined
   if (!request) {
@@ -203,40 +229,69 @@ async function stepBack($: EngineInterface, p: Point) {
   return showView($, 'answer', 'answer:0')
 }
 
-// 記録を切り (とファイルを戻し)、同じセッションを読み直す。回答を選び直したときは AI に続きを始めさせ、
-// 人の発言の地点ではその発言を入力欄に戻す
+// ログに書く (知らせの文に出さない生の理由)。ログの失敗は巻き戻しに響かせない
+function log($: EngineInterface, text: string) {
+  try {
+    $.ui.log(`better-rewind: ${text}`)
+  } catch {
+    // ログが書けなくても続ける
+  }
+}
+
+// 記録を切り (とファイルを戻し)、同じセッションを読み直す。回答を選び直したときは Claude に続きを始めさせ、
+// 人の発言の地点ではその発言を入力欄に戻す (会話を戻したときだけ)。
+// helper の失敗 (error) では、ふつう記録もファイルも変わっていない (書き戻せなかったファイルは error の文に場所が出る)。
+// ただし戻し終えた後で終わった印を書けなかったときは、error に transcriptChanged と戻した結果 (restored など) が付いてくる。
+// 記録が書き換わっていれば (transcriptChanged: true) 読み直してから知らせ、ファイルだけ戻したときは戻した件数と一緒に知らせる。
+// helper が答えなかったとき (isUnknown) は途中まで進んだかもしれないので、会話を戻す巻き戻しなら読み直して知らせる
 async function execute($: EngineInterface, p: Point, m: Mode, given?: string[]) {
   if (await refuseWhileRunning($)) return
   await update($, status, () => 'Rewinding…')
   const sessionId = await $.session.id()
   const spec = { uuid: p.uuid, toolUseId: p.toolUseId, label: p.label, mode: m, answers: given }
-  const out = await node<RewindResult>($, ['rewind', sessionId], JSON.stringify(spec))
-  const failure = out.error !== undefined || !out.restored || !out.removed ? (out.error ?? 'Could not read the result') : undefined
-  // 記録を書き換えたなら、途中で失敗していても読み直す (記録と動いている会話を食い違わせない)
+  const out = await node<RewindResult>($, ['rewind', sessionId], JSON.stringify(spec), REWIND_TIMEOUT)
+  const isUnknown = out.isUnknown === true || (out.error === undefined && (!out.restored || !out.removed))
   const changed = out.transcriptChanged === true
-  if (failure !== undefined && !changed) {
-    const msg = `Rewind failed: ${failure}`
+  // 戻し終えた後の失敗 (戻した結果が付いている)
+  const finished = out.error !== undefined && Array.isArray(out.restored) && Array.isArray(out.removed)
+  if (out.error !== undefined && !isUnknown && !changed && !finished) {
+    const msg = `Rewind failed: ${out.error}`
     await update($, status, () => msg)
-    $.ui.toast(msg)
+    $.ui.toast(msg, LONG_TOAST)
     return
   }
   await update($, status, () => '')
   await closePane($)
+  if (isUnknown) {
+    // 生の理由 (時間切れ・起動できない・読めない出力) はログへ。知らせには利用者が次にすることを書く
+    log($, `the rewind did not report back: ${out.error ?? 'no answer'}`)
+    // 記録が書き換わったか分からない。読み直せば、動いている会話を記録に合わせられる (変わっていなければ同じ会話が戻る)
+    const reloaded = m !== 'files' && (await $.command.run({ command: 'resume', args: sessionId }).then(() => true, () => false))
+    const next = m === 'files' ? '' : reloaded ? ' The conversation was reloaded in case it changed.' : ` Run /resume ${sessionId} to reload the conversation in case it changed.`
+    $.ui.toast(
+      `The rewind may not have finished: it stopped before reporting back (for example, because it ran longer than 10 minutes).${next} If it stopped partway, the next time you open /better-rewind it tells you which files may be affected and where their earlier contents are`,
+      LONG_TOAST,
+    )
+    return
+  }
   if (m !== 'files' || changed) {
     try {
       await $.command.run({ command: 'resume', args: sessionId })
     } catch (err) {
-      $.ui.toast(`The transcript was rewound but could not be reloaded. Run /resume ${sessionId} (${String(err)})`)
+      $.ui.toast(`The transcript was rewound but could not be reloaded. Run /resume ${sessionId} (${String(err)})`, LONG_TOAST)
       return
     }
-    if (failure !== undefined) {
-      $.ui.toast(`The conversation was rewound and reloaded, but part of it failed: ${failure}`)
+    if (out.error !== undefined) {
+      $.ui.toast(`The conversation was rewound and reloaded, but part of it failed: ${out.error}`, LONG_TOAST)
       return
     }
     if (given) void $.prompt.submit({ text: CONTINUE }).catch(() => undefined)
     else if (p.kind === 'prompt' && p.text) await $.prompt.fill({ text: p.text }).catch(() => undefined)
   }
-  $.ui.toast(doneMessage(m, { restored: out.restored ?? [], removed: out.removed ?? [] }))
+  const done = doneMessage(m, { restored: out.restored ?? [], removed: out.removed ?? [], skipped: out.skipped ?? [] })
+  // ファイルだけ戻した後の失敗は、戻したことと一緒に知らせる
+  if (out.error !== undefined) $.ui.toast(`${done}. ${out.error}`, LONG_TOAST)
+  else $.ui.toast(done)
 }
 
 // 控えの保存先 (<設定フォルダ>/better-rewind/<session>)。セッションごとに 1 度だけ node に聞く
@@ -253,33 +308,86 @@ function dataDir($: EngineInterface, sessionId: string): Promise<string> {
   return asked
 }
 
-// Edit / Write / NotebookEdit の実行直前の中身を snaps/<tool_use id>.json (と .b64) に控える。
+// Edit / Write / NotebookEdit の実行直前の中身を snaps/<tool_use id>.json (と .b64) に控える (state は 'pending')。
 // 無いファイル (ENOENT) は「無かった」と記録する。あるのに読めないなど他の理由で stat に失敗したら控えを取らない
 // (「無かった」と控えると、戻すときに消してしまう)。エラーに ENOENT が読めないときは exists で確かめる。
-// 大きいファイルは node に写させる
-async function snapshot($: EngineInterface, toolUseId: string, tool: string, file: string) {
+// 大きいファイルは node に写させる。返す値は書いた情報 (ファイルでないものは控えないので undefined)。
+// $.fs で読んだ中身 (base64) は、ツールが断られたときにファイルが変わったかを比べるために、書いた情報の外で持って返す
+type Taken = Snap & { base64?: string }
+async function snapshot($: EngineInterface, toolUseId: string, tool: string, file: string): Promise<Taken | undefined> {
   const sessionId = await $.session.id()
   const dir = `${await dataDir($, sessionId)}/snaps`
   const id = snapName(toolUseId)
-  const meta = { toolUseId, tool, path: file, at: Date.now(), existed: false }
+  const meta: Snap = { toolUseId, tool, path: file, at: Date.now(), existed: false, state: 'pending' }
   const stat = await $.fs.stat(file).catch(async (err: unknown) => {
     if (isMissing(err) || !(await $.fs.exists(file))) return undefined
     throw err
   })
-  if (stat && stat.kind !== 'file') return
+  if (stat && stat.kind !== 'file') return undefined
   if (stat && stat.size > INLINE_MAX) {
-    const out = await node($, ['snap', sessionId, toolUseId, tool, file, String(meta.at)])
+    const out = await node<Snap>($, ['snap', sessionId, toolUseId, tool, file, String(meta.at)])
     if (out.error !== undefined) throw new Error(out.error)
-    return
+    return { ...meta, existed: true, data: `${id}.bin` }
   }
   if (stat) {
     const { base64 } = await $.fs.read(file, { as: 'bytes' })
+    const taken: Snap = { ...meta, existed: true, data: `${id}.b64` }
     // 中身を書いてから情報を書く (情報があれば中身もある)
     await $.fs.write(`${dir}/${id}.b64`, base64)
-    await $.fs.write(`${dir}/${id}.json`, JSON.stringify({ ...meta, existed: true, data: `${id}.b64` }))
-    return
+    await $.fs.write(`${dir}/${id}.json`, JSON.stringify(taken))
+    return { ...taken, base64 }
   }
   await $.fs.write(`${dir}/${id}.json`, JSON.stringify(meta))
+  return meta
+}
+
+// 控えに失敗したとき: 利用者に知らせ、「控えが無い」印 (failed) を残す。印があれば、後でこの時点より前へ戻すとき
+// このファイルを途中の版へ黙って戻さずに「戻さない」と出せる。印も書けなければ undefined
+async function snapFailed($: EngineInterface, toolUseId: string, tool: string, file: string, err: unknown): Promise<Snap | undefined> {
+  $.ui.log(`better-rewind: could not back up ${file}: ${String(err)}`)
+  $.ui.toast(`better-rewind could not back up ${file} before ${tool} changed it, so Restore code cannot bring back its earlier contents`, LONG_TOAST)
+  const marker: Snap = { toolUseId, tool, path: file, at: Date.now(), existed: false, state: 'pending', failed: true }
+  try {
+    await $.fs.write(`${await dataDir($, await $.session.id())}/snaps/${snapName(toolUseId)}.json`, JSON.stringify(marker))
+    return marker
+  } catch {
+    return undefined
+  }
+}
+
+// 拒否・失敗の結果が来たのに、ファイルが控えた時から変わっているか。後段の hook がツールの実行後に断ったときや、
+// ツールが途中で止まったときに起きる。読めないなど比べられなければ throw する (控えは 'pending' のまま残り、
+// 後で戻すときに「実行されたか分からない」として途中の版へ黙って戻さない)
+async function changedSince($: EngineInterface, taken: Taken, file: string): Promise<boolean> {
+  if (!taken.existed) return $.fs.exists(file)
+  // 消えていれば変わった。ほかの理由で読めなければ比べられない
+  const now = await $.fs.read(file, { as: 'bytes' }).catch(async (err: unknown) => {
+    if (isMissing(err) || !(await $.fs.exists(file))) return undefined
+    throw err
+  })
+  return now === undefined || now.base64 !== taken.base64
+}
+
+// ツールの結果を見て控えの state を決める。実行されたら 'ran'。拒否・失敗でもファイルが変わっていれば、実行された
+// (控えはその直前の中身) として 'ran' にする。変わっていなければ戻す対象から外し ('denied')、中身を消す (人が拒んだ
+// ファイルの中身を残さない)。控えに失敗した印は、拒否・失敗のとき比べる中身が無いので 'pending' のまま残す。
+// 大きいファイル (.bin) は node が比べて決める。ここでの失敗はツールの結果に響かせない
+async function settleSnap($: EngineInterface, taken: Taken, file: string, ran: boolean) {
+  const sessionId = await $.session.id()
+  const dir = `${await dataDir($, sessionId)}/snaps`
+  const id = snapName(taken.toolUseId)
+  const { base64: _, ...snap } = taken
+  if (!ran && snap.failed === true) return
+  const isBig = snap.data !== undefined && !snap.data.endsWith('.b64')
+  if (ran || (!isBig && (await changedSince($, taken, file)))) {
+    await $.fs.write(`${dir}/${id}.json`, JSON.stringify({ ...snap, state: 'ran' }))
+    return
+  }
+  const { data, ...rest } = snap
+  await $.fs.write(`${dir}/${id}.json`, JSON.stringify({ ...rest, state: 'denied' }))
+  if (data?.endsWith('.b64')) await $.fs.write(`${dir}/${data}`, '')
+  // 大きいファイルは node が今の中身と比べ、変わっていれば控えを 'ran' に戻し、変わっていなければ中身ごと消す
+  else if (data) await node($, ['drop', sessionId, taken.toolUseId])
 }
 
 async function openBranches($: EngineInterface) {
@@ -350,18 +458,33 @@ async function renderModes($: EngineInterface, ui: Ui, p: Point) {
   const focus = await read($, sub)
   const options = modeOptions(p, await read($, points))
   const at = options.some(o => `mode:${o.key}` === focus) ? focus : `mode:${options[0]?.key}`
-  const c = changesParts(p.changes)
+  // Restore code が戻すファイル: rewind と同じ計画 (地点より後の発言で変わったファイルも含む) を helper から受け取って出す
+  const r = restoreLines(p.restore)
   return (
     <Box flexDirection="column">
       {header(ui, isAsk(p) ? `Change your answer to "${p.label}"` : `Rewind to just before "${p.label}"`)}
       <Box flexDirection="column" marginTop={1}>
         {options.map(o => choiceRow(ui, `mode:${o.key}`, o.label, `mode:${o.key}` === at, () => void pickMode($, p, o.key)))}
       </Box>
-      {p.restorable && (
-        <Box marginTop={1}>
-          <Text dimColor wrap="truncate-end">
-            Files are restored to how they were before Edit / Write changed them after this point ({c.text})
-          </Text>
+      {(p.restorable || r.skipped) && (
+        <Box flexDirection="column" marginTop={1}>
+          {p.restorable && (
+            <Text key="restore:lead" dimColor wrap="truncate-end">
+              {r.lead}
+            </Text>
+          )}
+          {p.restorable &&
+            r.files.map((f, i) => (
+              <Text key={`restore:${i}`} dimColor wrap="truncate-end">
+                {'  '}
+                {f}
+              </Text>
+            ))}
+          {r.skipped && (
+            <Text key="restore:skipped" color="warning" wrap="truncate-end">
+              {r.skipped}
+            </Text>
+          )}
         </Box>
       )}
       {footer(ui, await read($, status), '↑↓ to select · Enter to confirm · Esc to close')}
@@ -501,9 +624,10 @@ export const register: Register = on => {
     const list = await loadPoints($)
     const opened = await $.ui.open({ id: PANE, title: 'Better Rewind', focus: true, closeOnEscape: true })
     await update($, isOpen, () => true)
-    // キーボードを一覧の (現在) に置く。渡せなかったときは理由を出力に残す (Tab かクリックで渡せる)
+    // キーボードを一覧の (現在) に置く。渡せなかったときは Tab かクリックで渡せることを案内する (理由はログへ)
     const focused = await $.ui.focus({ requestId: PANE, key: CURRENT }).catch((err: unknown) => ({ deny: String(err) }))
-    const note = 'deny' in focused ? ` (could not move keyboard focus: ${focused.deny})` : ''
+    if ('deny' in focused) $.ui.log(`better-rewind: could not move keyboard focus: ${focused.deny}`)
+    const note = 'deny' in focused ? ' (press Tab or click the list to use the keyboard there)' : ''
     return { text: `Opened ${plural(list.length, 'rewind point')}${opened.isPlaced ? '' : ' (waiting: terminal too narrow)'}${note}` }
   })
 
@@ -560,11 +684,16 @@ export const register: Register = on => {
     // ここに来るのは頼みを下ろす前の失敗だけ。分けずにそのまま通す
     .catch(($, e, next) => next(e))
 
-  // 書き換える直前のファイルを控える。控えに失敗してもツールは止めない
+  // 書き換える直前のファイルを控える。控えに失敗してもツールは止めない (知らせて印を残す)。
+  // 控えは権限の確認より前に取るので、ツールの結果を見て、実行された呼び出しの控えだけを戻す対象にする
+  // (拒否・失敗した呼び出しの控えで、人が拒んだファイルを後から書き換えない)
   on('tool.call', async ($, e, next) => {
     const file = editedFile(e)
-    if (file !== undefined) await snapshot($, e.tool_use_id, e.tool, file).catch((err: unknown) => $.ui.log(`better-rewind: could not back up ${file}: ${String(err)}`))
-    return next(e)
+    if (file === undefined) return next(e)
+    const taken: Taken | undefined = await snapshot($, e.tool_use_id, e.tool, file).catch((err: unknown) => snapFailed($, e.tool_use_id, e.tool, file, err))
+    const result = await next(e)
+    if (taken) await settleSnap($, taken, file, result.deny === undefined && result.isError !== true).catch((err: unknown) => log($, `could not record whether ${e.tool} ran on ${file}: ${String(err)}`))
+    return result
   }).catch(($, e, next) => next(e))
 
   // 矢印・Tab・クリックでフォーカスが動いたら、それをカーソルにする (一覧以外の段階では sub に)
@@ -643,7 +772,7 @@ export const register: Register = on => {
           {items}
         </Box>
         <Box marginTop={1}>
-          <Text dimColor>── AI reply from this point</Text>
+          <Text dimColor>── Claude's reply from this point</Text>
         </Box>
         {/* AI の返答と同じ描き方 (見出し・強調・コード)。行数は元の文で見積もって切る */}
         <Markdown text={clipToRows(selected ? selected.reply || '(no reply)' : 'This is the current state', previewRows, columns)} />

@@ -24,8 +24,47 @@ export type Point = {
   changes: { files: string[]; added: number; removed: number }
   // 会話を戻せるか (最初の発言の前や、切ると記録が壊れる地点は false)
   canCut: boolean
-  // 戻せるファイルの控えがあるか
+  // 戻せるファイルの控えがあるか (restore.total > 0)
   restorable: boolean
+  // Restore code が戻すファイル。rewind と同じ計画 (fileRestorePlan) で、地点より後の発言で変わったファイルも含む
+  restore: RestorePlan
+}
+
+// Restore code が戻すファイルの要約。files と skipped は先頭の数件だけ (件数は total と skippedTotal)。
+// total と files は実際に書く・消すファイルだけ (地点の時点で無く、今も無いファイルは消すものが無いので数えない)
+export type RestorePlan = {
+  total: number
+  // write は控えの中身に戻す、delete は地点の時点で無かったので消す
+  files: { path: string; action: 'write' | 'delete' }[]
+  // 編集の直前に控えを取れなかった (か、実行されたか分からない) ので戻さないファイル
+  skippedTotal: number
+  skipped: string[]
+}
+
+// 途中で打ち切られた巻き戻し。bin/transcript.mjs の unfinished() が返す形 (points と一緒に届く)
+export type Unfinished = {
+  id: string
+  at: string
+  label: string
+  // 戻そうとしていたファイル
+  files: string[]
+  // 戻す前の中身を退避したフォルダと、どのファイルかを書いた情報ファイル
+  saved: string
+  details: string
+}
+
+// ファイルの控えの情報 (snaps/<tool_use id>.json)。state は bin/transcript.mjs の「ファイルの控え」の説明を参照
+// (拒否・失敗の結果でもファイルが変わっていれば 'ran')
+export type Snap = {
+  toolUseId: string
+  tool: string
+  path: string
+  at: number
+  existed: boolean
+  data?: string
+  state: 'pending' | 'ran' | 'denied'
+  // 控えを取ろうとして失敗した印 (中身は無い)
+  failed?: true
 }
 
 // 戻し方: 会話とファイル / 会話だけ / ファイルだけ
@@ -69,8 +108,12 @@ export type RewindResult = {
   dropped: number
   restored: string[]
   removed: string[]
-  // 記録を書き換えたか。失敗の結果でも true なら mod は読み直す
-  transcriptChanged?: boolean
+  // 控えが取れていないので戻さなかったファイル
+  skipped: string[]
+  // 記録を書き換えたか (会話を戻したとき true)。helper は記録の rename を最後の書き換えに置くので、ふつうの失敗では
+  // error と false を返す (記録は書き換えていない)。戻し終えた後で終わった印を書けなかったときだけ、error と一緒に
+  // 戻した結果 (restored・removed など) と、会話を戻したなら true を返す。mod は true なら読み直してから失敗を知らせる
+  transcriptChanged: boolean
 }
 
 declare module 'claude-code' {

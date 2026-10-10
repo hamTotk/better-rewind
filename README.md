@@ -29,7 +29,8 @@ To remove it: `claude plugin uninstall better-rewind`.
 - `/better-rewind` opens the list of points: each of your prompts, and each AskUserQuestion question (indented under its prompt). Other tool calls are not listed; they show as `▸ Tool` lines in the reply preview.
 - `↑` / `↓` select a point, and the reply that followed it is shown below. `Enter` chooses it; `Esc` closes the pane.
 - Then pick what to do. The wording and order follow the built-in Rewind:
-  - **Restore code and conversation**, **Restore conversation**, **Restore code**: go back to just before the point. A prompt you rewind to is put back in the input field.
+  - **Restore code and conversation**, **Restore conversation**, **Restore code**: go back to just before the point. When the conversation is rewound to one of your prompts, that prompt is put back in the input field (**Restore code** alone leaves the conversation and the input field as they are).
+  - **Restore code** puts back every file that changed after the point, including changes made after later prompts. Before you choose, the pane lists how many files that is and their names, and any file it cannot restore.
   - On a question point, the conversation choices read **…, then re-answer**. You choose an answer for each question (one of the options, or your own), and Claude continues from it.
   - **Summarize from here**: replace the point and everything after it with a summary; earlier messages stay as they are.
   - **Summarize up to here**: replace everything before the point with a summary; the point and what follows stay as they are.
@@ -41,11 +42,18 @@ To remove it: `claude plugin uninstall better-rewind`.
 ## How it works
 
 - **Conversation:** the mod cuts the session's transcript (`~/.claude/projects/<project>/<session>.jsonl`) at the point and reloads the same session with `/resume`. No new session is created. The full transcript from before the cut is saved first.
-- **Code:** just before each Edit, Write or NotebookEdit, the mod saves the file as it was (or notes that it did not exist). Restoring puts every file changed after the point back to that state, and removes files that were created after it. Changes made through Bash are not tracked, and edits made before the mod was installed cannot be restored.
+- **Code:** just before each Edit, Write or NotebookEdit, the mod saves the file as it was (or notes that it did not exist), then notes whether the call actually ran. Restoring puts every file changed after the point back to that state, and removes files that were created after it. Changes made through Bash are not tracked, and edits made before the mod was installed cannot be restored.
+  - A call you declined, or one that failed, is not used: the mod never writes a file through a call that did not run, and it clears the copy it took of that file. If the file changed anyway (the call was stopped after it had already written, or stopped partway), the copy is kept and used like any other edit, so the file is not put back to an in-between version.
+  - If a file could not be saved before an edit, you get a notice at that moment, and later that file is listed as not restored instead of being put back to a later, in-between version.
+  - Files changed by a rewind are saved the same way, so rewinding again to an earlier point gets the contents that point really had.
+  - A file that is now a symbolic link is not written. For a file inside the working folder (the folder the session started in), the folders between the working folder and the file are checked too, and the file is not written if one of them is now a symbolic link or junction. The rewind then stops with the reason and changes nothing. For a file outside the working folder, only the file itself is checked.
 - **Summary:** the mod runs the built-in `/compact` and splits the conversation at the point, so only one side is summarized. The transcript is not edited directly, and a `/compact` line appears in the conversation.
-- **If something fails, nothing changes.** Files are restored first and the transcript last; if a step fails, the restored files are put back and the reason is shown.
+- **If something fails, nothing changes.** Files are restored first and the transcript last; if a step fails, the files it touched (including one that failed partway through writing) are put back and the reason is shown. If a file cannot be put back either, the message names it and the folder holding its earlier contents. If Claude adds to the conversation while the rewind runs, the rewind stops and changes nothing, so no new lines are lost.
+- If a rewind is stopped before it finishes (it ran longer than 10 minutes, or Claude Code was closed while it ran), you are told right away that it may not have finished. The next time you open `/better-rewind`, a notice says which rewind it was, which files may be affected and where their earlier contents are. That notice appears only once.
 
-Saved data lives in `~/.claude/better-rewind/<session>/` (under `CLAUDE_CONFIG_DIR` if set): `snaps/` holds the file backups, `branches/` the transcripts before each rewind. Nothing is deleted automatically; delete the folder when you no longer need it.
+Saved data lives in `~/.claude/better-rewind/<session>/` (under `CLAUDE_CONFIG_DIR` if set): `snaps/` holds the file backups, `branches/` what each rewind replaced. Nothing is deleted automatically; delete the folder when you no longer need it.
+
+**Getting back files that Restore code overwrote.** Before a rewind changes any file, it copies the file's current contents to `branches/<time>.files/<n>`. `branches/<time>.json` lists each restored file's `path` and its copy in `backup` (`null` when the file did not exist), so copy that file back over `path`. `<time>` is when you rewound (UTC, for example `2026-10-10T05-03-00-000Z`). `branches/<time>.jsonl` is the whole transcript from before a conversation rewind.
 
 ## Notes
 
@@ -99,7 +107,8 @@ MIT
 - `/better-rewind` で地点の一覧が開きます。地点は自分の発言と、AskUserQuestion の質問 (発言の下に字下げして表示) です。ほかのツール呼び出しは一覧に出ず、返答のプレビューに `▸ ツール名` の 1 行で出ます。
 - ↑ / ↓ で地点を選ぶと、その後に続いた返答が下に出ます。Enter で決定、Esc で閉じます。
 - 続けて何をするかを選びます。言葉と並びは組み込みの Rewind に合わせて英語です。
-  - **Restore code and conversation** / **Restore conversation** / **Restore code:** 地点の直前に戻します。自分の発言の地点に戻すと、その発言が入力欄に戻ります。
+  - **Restore code and conversation** / **Restore conversation** / **Restore code:** 地点の直前に戻します。会話を自分の発言の地点に戻すと、その発言が入力欄に戻ります (**Restore code** だけのときは、会話も入力欄もそのままです)。
+  - **Restore code** は、地点より後に変わったファイルをすべて戻します。後の発言で変わったファイルも含みます。選ぶ前の画面に、戻すファイルの数と名前、戻せないファイルが出ます。
   - 質問の地点では、会話を戻す選択肢が「…, then re-answer」になります。質問ごとに回答 (選択肢か自分で書いた文) を選ぶと、Claude がその回答で続けます。
   - **Summarize from here:** 地点から後ろを要約に置き換えます。地点より前はそのまま残ります。
   - **Summarize up to here:** 地点より前を要約に置き換えます。地点から後ろはそのまま残ります。
@@ -111,11 +120,18 @@ MIT
 ### 仕組み
 
 - **会話:** セッションの記録ファイル (`~/.claude/projects/<project>/<session>.jsonl`) を地点で切り、同じセッションを `/resume` で読み直します。新しいセッションは増えません。切る前の記録は先に丸ごと保存します。
-- **コード:** Edit・Write・NotebookEdit の直前に、対象のファイルの中身 (無ければ「無かった」こと) を控えます。戻すときは、地点より後に変わったファイルを控えの状態に戻し、地点より後に作られたファイルは消します。Bash で変わったファイルと、mod を入れる前の編集は戻せません。
+- **コード:** Edit・Write・NotebookEdit の直前に、対象のファイルの中身 (無ければ「無かった」こと) を控え、その呼び出しが実際に実行されたかも書き足します。戻すときは、地点より後に変わったファイルを控えの状態に戻し、地点より後に作られたファイルは消します。Bash で変わったファイルと、mod を入れる前の編集は戻せません。
+  - 拒否した呼び出しと失敗した呼び出しの控えは使いません。実行されなかった呼び出しを通してファイルを書くことはなく、その控えの中身も消します。ただし、それでもファイルが変わっていたとき (書いた後で止められた、途中で止まった) は控えを残し、ふつうの編集と同じく戻すのに使います。ファイルを途中の版へ戻さないためです。
+  - 編集の前にファイルを控えられなかったときは、その場で通知します。後で戻すときも、そのファイルを途中の版へ戻さず「戻せない」と出します。
+  - 巻き戻しで変えたファイルも同じように控えます。後でもっと前の地点へ戻すと、その地点の本当の中身になります。
+  - 戻す先が今シンボリックリンクになっているファイルは書きません。作業フォルダ (セッションを始めたフォルダ) の中のファイルは、作業フォルダからそのファイルまでの途中のフォルダも確かめ、どれかが今シンボリックリンクかジャンクションなら書きません。そのときは理由を出して止まり、何も変えません。作業フォルダの外のファイルは、そのファイル自体だけを確かめます。
 - **要約:** 組み込みの `/compact` を動かし、会話を地点で分けて片側だけを要約させます。記録ファイルは直接書き換えません。会話には `/compact` の行が残ります。
-- **失敗したときは何も変えません。** ファイルを先に戻し、記録の書き換えを最後にします。途中で失敗したら、戻したファイルを元に戻してから理由を出します。
+- **失敗したときは何も変えません。** ファイルを先に戻し、記録の書き換えを最後にします。途中で失敗したら、手を付けたファイル (書いている途中で失敗したファイルも) を元に戻してから理由を出します。元に戻せないファイルが残ったときは、そのファイル名と、前の中身を置いたフォルダを出します。巻き戻しの最中に Claude が会話へ書き足したときも、何も変えずに止まります (書き足した行は消えません)。
+- 巻き戻しが終わる前に止まったとき (10 分を超えた、動いている間に Claude Code を閉じた) は、その場で「終わっていないかもしれない」と通知します。次に `/better-rewind` を開いたときには、どの巻き戻しだったか、影響を受けたかもしれないファイル、その前の中身の場所を通知します。この通知は 1 度だけです。
 
-保存先は `~/.claude/better-rewind/<session>/` (`CLAUDE_CONFIG_DIR` があればその下) です。`snaps/` にファイルの控え、`branches/` に巻き戻す前の記録が入ります。自動では消さないので、要らなくなったらフォルダごと消してください。
+保存先は `~/.claude/better-rewind/<session>/` (`CLAUDE_CONFIG_DIR` があればその下) です。`snaps/` にファイルの控え、`branches/` に巻き戻しで置き換えた中身が入ります。自動では消さないので、要らなくなったらフォルダごと消してください。
+
+**Restore code で上書きしたファイルを取り戻すには:** 巻き戻しはファイルを変える前に、今の中身を `branches/<時刻>.files/<番号>` に写します。`branches/<時刻>.json` の `files` に、戻したファイルの `path` と写しの場所 `backup` (ファイルが無かったときは `null`) が並ぶので、その写しを `path` へコピーし直してください。`<時刻>` は巻き戻した時刻 (UTC。例: `2026-10-10T05-03-00-000Z`) です。会話を戻したときは、切る前の記録全体が `branches/<時刻>.jsonl` に入ります。
 
 ### 注意
 

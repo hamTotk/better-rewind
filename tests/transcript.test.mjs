@@ -1,4 +1,5 @@
 import { test } from 'node:test'
+import { after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -11,14 +12,18 @@ import {
   branches,
   cutPlan,
   dataDir,
+  dropSnap,
   editStats,
   fileRestorePlan,
   leafOf,
   points,
   readSnaps,
   rewind,
+  settleDenied,
   snap,
   toolLabel,
+  toolResults,
+  unfinished,
 } from '../bin/transcript.mjs'
 
 const SCRIPT = fileURLToPath(new URL('../bin/transcript.mjs', import.meta.url))
@@ -157,6 +162,8 @@ test('leafOf: 最後の uuid 行より後に書かれた last-prompt が記録�
 test('editStats は Edit の差分行と、Write の新規作成の行数を数える', () => {
   assert.deepEqual(editStats({ filePath: 'C:/x/a.ts', structuredPatch: [{ lines: [' a', '-b', '+c', '+d'] }] }), { file: 'C:/x/a.ts', added: 2, removed: 1 })
   assert.deepEqual(editStats({ type: 'create', filePath: 'n.md', content: 'x\ny\n', structuredPatch: [] }), { file: 'n.md', added: 2, removed: 0 })
+  // 空のファイルを作っても行は増えない
+  assert.deepEqual(editStats({ type: 'create', filePath: 'e.md', content: '', structuredPatch: [] }), { file: 'e.md', added: 0, removed: 0 })
   assert.equal(editStats({ stdout: 'ok' }), null)
 })
 
@@ -269,13 +276,20 @@ test('fileRestorePlan は時刻以降の控えのうち、ファイルごとに�
     { path: 'C:/x/b.ts', at: 3, existed: false },
     { path: 'C:/x/c.ts', at: 4, existed: true },
   ]
-  assert.deepEqual(fileRestorePlan(snaps, 3).map(s => `${s.path}@${s.at}`), ['C:/x/b.ts@3', 'C:/x/c.ts@4'])
-  assert.deepEqual(fileRestorePlan(snaps, undefined), [])
+  assert.deepEqual(fileRestorePlan(snaps, 3).files.map(s => `${s.path}@${s.at}`), ['C:/x/b.ts@3', 'C:/x/c.ts@4'])
+  assert.deepEqual(fileRestorePlan(snaps, undefined), { files: [], skipped: [] })
+})
+
+// sandbox() が作った一時フォルダ。全部のテストの後で消す
+const bases = []
+after(() => {
+  for (const base of bases) fs.rmSync(base, { recursive: true, force: true })
 })
 
 // 一時フォルダに偽の設定フォルダ (projects/p/S.jsonl) と作業フォルダを作る。make は作業フォルダから記録の行を作る
 function sandbox(make = convo) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'better-rewind-'))
+  bases.push(base)
   const work = path.join(base, 'work')
   fs.mkdirSync(path.join(base, 'projects', 'p'), { recursive: true })
   fs.mkdirSync(work)
@@ -400,8 +414,8 @@ test('rewind に失敗したときは記録もファイルも変えず、保存�
   // 中身の読めない控えがあれば、ファイルに触れる前に止まる
   writeSnap(s.dir, 'w2', { tool: 'Write', path: path.join(s.work, 'o.md'), at: ms(8) + 2 }, 'o 前')
   fs.rmSync(path.join(s.dir, 'snaps', 'w2.b64'))
-  assert.throws(() => rewind(s.file, { uuid: 'a4', toolUseId: 'q1', mode: 'both', answers: ['青'] }, s.dir))
-  assert.throws(() => rewind(s.file, { uuid: 'u1', mode: 'files' }, s.dir))
+  assert.throws(() => rewind(s.file, { uuid: 'a4', toolUseId: 'q1', mode: 'both', answers: ['青'] }, s.dir), /^Error: Could not read the file backup: .*o\.md \(not found\)$/)
+  assert.throws(() => rewind(s.file, { uuid: 'u1', mode: 'files' }, s.dir), /^Error: Could not read the file backup: .*o\.md \(not found\)$/)
   assert.equal(fs.readFileSync(s.file, 'utf8'), s.raw)
   assert.equal(fs.existsSync(path.join(s.dir, 'branches')), false)
 })
@@ -420,6 +434,8 @@ function twoFiles() {
     assert.equal(fs.readFileSync(w('o.md'), 'utf8'), 'o 今')
     assert.equal(fs.existsSync(path.join(s.dir, 'branches')), false)
     assert.equal(fs.existsSync(`${s.file}.better-rewind.tmp`), false)
+    // rewind 自身の控えも残さない
+    assert.deepEqual(readSnaps(s.dir).filter(x => x.tool === 'better-rewind'), [])
   }
   return { ...s, w, unchanged, spec: { uuid: 'a4', toolUseId: 'q1', label: 'AskUserQuestion 色は?', mode: 'both', answers: ['青'] } }
 }
@@ -452,7 +468,7 @@ test('rewind: 記録を書き換えられなければ、戻したファイルを
   }
 })
 
-test('rewind: 戻す前のファイルを退避できなければ、作りかけの保存を片付けて日本語で理由を出す', () => {
+test('rewind: 戻す前のファイルを退避できなければ、作りかけの保存を片付けて理由つきの英語の文で知らせる', () => {
   const s = twoFiles()
   const id = new Date(T(30)).toISOString().replace(/[:.]/g, '-')
   // o.md (2 つ目) の退避先にフォルダを置いて、写せないようにする
@@ -498,4 +514,398 @@ test('コマンドとして: rewind は spec を stdin で受け、失敗は JSO
   const after = JSON.parse(run(['points', 'S']).stdout).points
   assert.deepEqual(after.map(p => p.label), ['直して', 'AskUserQuestion 色は?'])
   assert.match(JSON.parse(run(['points', '../x']).stdout).error, /Invalid session id/)
+})
+
+// ---- レビューの指摘への対応 ----
+
+// テスト用のファイル操作: node:fs のまま、over に書いた関数だけ差し替える
+const io = over => ({ ...fs, ...over })
+const enospc = () => Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+
+test('rewind (回答を選び直す): last-prompt には新しい回答より前の最後の人の発言が入る', () => {
+  const s = sandbox()
+  rewind(s.file, { uuid: 'a4', toolUseId: 'q1', mode: 'conversation', answers: ['青'] }, s.dir, new Date(T(30)))
+  assert.equal(fileRows(s.file).at(-1).lastPrompt, '直して')
+})
+
+// 中断などで結果の無いツール呼び出しが今の会話に元からある記録 (u2 の直前に結果の無い Bash)
+const withDangling = dir => {
+  const r = convo(dir)
+  const i = at(r, 'u2')
+  const z = aim('z', 'm9', [{ type: 'tool_use', id: 'z1', name: 'Bash', input: { command: 'sleep 99' } }], { timestamp: T(10) })
+  return linked([...r.slice(0, i), z, ...r.slice(i)].map(({ parentUuid, ...x }) => x))
+}
+
+test('assertCuttable: 今の会話に元からある結果の無い呼び出しは咎めず、その後ろの地点も戻せる', () => {
+  const r = withDangling()
+  assert.deepEqual(points(r).map(p => p.canCut), [false, true, true])
+  assert.doesNotThrow(() => assertCuttable(r, cutPlan(r, { uuid: 'u2' })))
+  const s = sandbox(withDangling)
+  const out = rewind(s.file, { uuid: 'u2', mode: 'conversation' }, s.dir, new Date(T(30)))
+  assert.equal(out.leaf, 'z')
+})
+
+test('fileRestorePlan: 拒否・失敗した呼び出しの控えは使わず、控えの失敗や実行の分からない控えは途中の版へ戻さずに skipped にする', () => {
+  const results = toolResults([user('r', [{ type: 'tool_result', tool_use_id: 'no', content: 'denied', is_error: true }, { type: 'tool_result', tool_use_id: 'ok', content: 'ok' }])])
+  const snaps = [
+    // 1.0.0 の控え (state 無し) でも、記録の結果がエラーなら使わない
+    { toolUseId: 'no', path: 'C:/x/secret', at: 1, existed: true },
+    { toolUseId: 'den', path: 'C:/x/a.ts', at: 1, existed: true, state: 'denied' },
+    { toolUseId: 'a2', path: 'C:/x/a.ts', at: 2, existed: true, state: 'ran' },
+    { toolUseId: 'fail', path: 'C:/x/b.ts', at: 1, existed: false, state: 'pending', failed: true },
+    { toolUseId: 'b2', path: 'C:/x/b.ts', at: 2, existed: true, state: 'ran' },
+    { toolUseId: 'pend', path: 'C:/x/c.ts', at: 1, existed: true, state: 'pending' },
+    { toolUseId: 'ok', path: 'C:/x/d.ts', at: 1, existed: true, state: 'pending' },
+  ]
+  const plan = fileRestorePlan(snaps, 1, results)
+  assert.deepEqual(plan.files.map(s => s.toolUseId).sort(), ['a2', 'ok'])
+  assert.deepEqual(plan.skipped.map(s => s.toolUseId).sort(), ['fail', 'pend'])
+})
+
+test('points: restore は Restore code が戻すファイル (後の発言の分も含む) と戻さないファイルを、rewind と同じ計画で持つ', () => {
+  const r = convo('C:/x')
+  const snaps = [
+    { toolUseId: 'w1', path: 'C:/x/n.md', at: ms(8) + 1, existed: false },
+    { toolUseId: 'w2', path: 'C:/x/o.md', at: ms(8) + 2, existed: true, data: 'w2.b64' },
+    { toolUseId: 'e9', path: 'C:/x/a.ts', at: ms(12), existed: false, state: 'pending', failed: true },
+    { toolUseId: 'e10', path: 'C:/x/p.md', at: ms(12) + 1, existed: true, state: 'ran', data: 'e10.b64' },
+  ]
+  const [u1, ask, u2] = points(r, snaps)
+  assert.deepEqual(u1.restore, {
+    total: 3,
+    files: [
+      { path: 'C:/x/n.md', action: 'delete' },
+      { path: 'C:/x/o.md', action: 'write' },
+      { path: 'C:/x/p.md', action: 'write' },
+    ],
+    skippedTotal: 1,
+    skipped: ['C:/x/a.ts'],
+  })
+  assert.equal(ask.restore.total, 3)
+  // u2 の応答ではファイルを変えていない (changes は空) が、Restore code は後で変わった p.md を戻す
+  assert.deepEqual(u2.changes.files, [])
+  assert.equal(u2.restorable, true)
+  assert.deepEqual(u2.restore.files, [{ path: 'C:/x/p.md', action: 'write' }])
+  assert.deepEqual(u2.restore.skipped, ['C:/x/a.ts'])
+})
+
+test('dropSnap は控えの情報と中身を消す', () => {
+  const s = sandbox()
+  fs.writeFileSync(path.join(s.work, 'f'), 'x')
+  snap(s.dir, 'toolu_x', 'Write', path.join(s.work, 'f'), 1, 'pending')
+  assert.equal(readSnaps(s.dir)[0].state, 'pending')
+  dropSnap(s.dir, 'toolu_x')
+  assert.deepEqual(fs.readdirSync(path.join(s.dir, 'snaps')), [])
+})
+
+test('rewind: 拒否・失敗した呼び出しの控え (記録の結果がエラー・denied の印) では、そのファイルを書き換えない', () => {
+  const s = sandbox(dir =>
+    // w2 の Write は人が拒否した
+    convo(dir).map(x => (x.uuid === 'r4' ? { ...x, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w2', content: 'denied', is_error: true }] } } : x)),
+  )
+  const o = path.join(s.work, 'o.md')
+  fs.writeFileSync(o, '人が後で書いた')
+  writeSnap(s.dir, 'w2', { tool: 'Write', path: o, at: ms(8) + 2 }, 'o 前')
+  writeSnap(s.dir, 'w1', { tool: 'Write', path: path.join(s.work, 'n.md'), at: ms(8) + 1, state: 'denied' })
+  assert.deepEqual(points(fileRows(s.file), readSnaps(s.dir)).map(p => p.restorable), [false, false, false])
+  assert.throws(() => rewind(s.file, { uuid: 'u1', mode: 'files' }, s.dir, new Date(T(30))), /^Error: No file backups to restore$/)
+  assert.equal(fs.readFileSync(o, 'utf8'), '人が後で書いた')
+})
+
+test('rewind: 控えに失敗した印のあるファイルは途中の版へ戻さず、skipped で返す', () => {
+  const s = twoFiles()
+  // a.ts の最初の控えは失敗している (その後の控え e9 は途中の版)
+  writeSnap(s.dir, 'e0', { tool: 'Edit', path: s.w('a.ts'), at: ms(6), state: 'ran', failed: true })
+  const out = rewind(s.file, s.spec, s.dir, new Date(T(30)))
+  assert.equal(fs.readFileSync(s.w('a.ts'), 'utf8'), 'a 今')
+  assert.equal(fs.readFileSync(s.w('o.md'), 'utf8'), 'o 前')
+  assert.deepEqual(out.skipped, [s.w('a.ts')])
+  // ファイルだけ戻すとき、戻せるファイルが無ければ理由に名前を出す
+  const t = twoFiles()
+  fs.rmSync(path.join(t.dir, 'snaps'), { recursive: true })
+  writeSnap(t.dir, 'e0', { tool: 'Edit', path: t.w('a.ts'), at: ms(6), state: 'ran', failed: true })
+  assert.throws(() => rewind(t.file, { uuid: 'u1', mode: 'files' }, t.dir, new Date(T(30))), /No file backups to restore \(no backup could be taken before .*a\.ts was edited\)/)
+})
+
+test('rewind: 戻す先のファイルを切り詰めた後で書き込みに失敗しても、そのファイルも書き戻し、退避も残さない', () => {
+  const s = twoFiles()
+  const fake = io({
+    writeFileSync: (p, d, ...rest) => {
+      if (p === s.w('o.md')) {
+        fs.writeFileSync(p, '')
+        throw enospc()
+      }
+      return fs.writeFileSync(p, d, ...rest)
+    },
+  })
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30)), fake), /^Error: Could not restore the file: .*o\.md \(disk is full\)$/)
+  s.unchanged()
+})
+
+test('rewind: 書き戻しにも失敗したら、退避した中身・切る前の記録・情報を残し、書き戻せなかったファイルと退避の場所を出す', () => {
+  const s = twoFiles()
+  const id = new Date(T(30)).toISOString().replace(/[:.]/g, '-')
+  const bd = path.join(s.dir, 'branches')
+  const fake = io({
+    writeFileSync: (p, d, ...rest) => {
+      if (p === s.w('o.md')) throw enospc()
+      return fs.writeFileSync(p, d, ...rest)
+    },
+    // 戻した a.ts を退避した中身へ書き戻すところだけ失敗させる
+    copyFileSync: (from, to, ...rest) => {
+      if (to === s.w('a.ts')) throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' })
+      return fs.copyFileSync(from, to, ...rest)
+    },
+  })
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30)), fake), err => {
+    assert.match(err.message, /^Could not restore the file: .*o\.md \(disk is full\)\. These files could not be put back: .*a\.ts\. Their contents from before the rewind are in /)
+    assert.ok(err.message.includes(path.join(bd, `${id}.files`)))
+    assert.ok(err.message.includes(path.join(bd, `${id}.json`)))
+    return true
+  })
+  // 記録は切っていない。a.ts は戻したまま (書き戻せなかった)、o.md は書く前に断られたので今のまま
+  assert.equal(fs.readFileSync(s.file, 'utf8'), s.raw)
+  assert.equal(fs.readFileSync(s.w('a.ts'), 'utf8'), 'a 前')
+  assert.equal(fs.readFileSync(s.w('o.md'), 'utf8'), 'o 今')
+  const meta = JSON.parse(fs.readFileSync(path.join(bd, `${id}.json`), 'utf8'))
+  assert.equal(meta.state, 'failed')
+  assert.deepEqual(meta.notRestored, [s.w('a.ts')])
+  const a = meta.files.find(f => f.path === s.w('a.ts'))
+  assert.equal(fs.readFileSync(path.join(bd, a.backup), 'utf8'), 'a 今')
+  // 情報が指す切る前の記録も残る
+  assert.equal(fs.readFileSync(path.join(bd, meta.transcript), 'utf8'), s.raw)
+  // 会話は切れていないので枝の一覧には出さない。失敗はその場で知らせたので、途中で止まった巻き戻しにも数えない
+  assert.deepEqual(branches(s.dir), [])
+  assert.deepEqual(unfinished(s.dir), [])
+})
+
+test('rewind: 読んでから置き換えるまでに記録へ書き足されたら、書き足しを消さずに断り、戻したファイルも書き戻す', () => {
+  const s = twoFiles()
+  const extra = `${JSON.stringify(user('late', '後から来た行', { parentUuid: 'a8' }))}\n`
+  const fake = io({
+    writeFileSync: (p, d, ...rest) => {
+      const r = fs.writeFileSync(p, d, ...rest)
+      // 切った記録を tmp に書いた直後に、Claude が記録へ 1 行書き足す
+      if (p === `${s.file}.better-rewind.tmp`) fs.appendFileSync(s.file, extra)
+      return r
+    },
+  })
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30)), fake), /^Error: Claude added to the conversation while it was being rewound, so nothing was changed/)
+  assert.equal(fs.readFileSync(s.file, 'utf8'), s.raw + extra)
+  assert.equal(fs.readFileSync(s.w('a.ts'), 'utf8'), 'a 今')
+  assert.equal(fs.readFileSync(s.w('o.md'), 'utf8'), 'o 今')
+  assert.equal(fs.existsSync(path.join(s.dir, 'branches')), false)
+  assert.equal(fs.existsSync(`${s.file}.better-rewind.tmp`), false)
+})
+
+test('rewind: 戻す先がシンボリックリンクなら、何も書かずに断る', () => {
+  const s = twoFiles()
+  const fake = io({ lstatSync: (p, ...rest) => (p === s.w('o.md') ? { isSymbolicLink: () => true } : fs.lstatSync(p, ...rest)) })
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30)), fake), /^Error: Cannot restore .*o\.md: it is now a symbolic link/)
+  s.unchanged()
+})
+
+test('rewind: 本物のシンボリックリンクでもリンク先を書き換えない (リンクを作れない環境では飛ばす)', t => {
+  const s = twoFiles()
+  const outside = path.join(s.base, 'outside.txt')
+  fs.writeFileSync(outside, '外')
+  fs.rmSync(s.w('o.md'))
+  try {
+    fs.symlinkSync(outside, s.w('o.md'))
+  } catch (err) {
+    t.skip(`シンボリックリンクを作れない (${err.code})`)
+    return
+  }
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30))), /symbolic link/)
+  assert.equal(fs.readFileSync(outside, 'utf8'), '外')
+  assert.equal(fs.readFileSync(s.w('a.ts'), 'utf8'), 'a 今')
+  assert.equal(fs.readFileSync(s.file, 'utf8'), s.raw)
+})
+
+test('rewind (ファイルだけ): 巻き戻しで変えたファイルも控えに残し、後でその間の地点へ戻すとその時点の中身になる', () => {
+  const s = sandbox()
+  const a = path.join(s.work, 'a.ts')
+  fs.writeFileSync(a, 'v1')
+  // u1 の後の Edit (控えは v0)
+  writeSnap(s.dir, 'e1', { tool: 'Edit', path: a, at: ms(3) + 1, state: 'ran' }, 'v0')
+  // u1 へファイルだけ戻す (a.ts は v0 に)。u2 (その間の地点) の時点では v1 だった
+  rewind(s.file, { uuid: 'u1', mode: 'files' }, s.dir, new Date(T(30)))
+  assert.equal(fs.readFileSync(a, 'utf8'), 'v0')
+  // 後で Claude がまた a.ts を変える (控えは v0)
+  writeSnap(s.dir, 'e5', { tool: 'Edit', path: a, at: ms(40), state: 'ran' }, 'v0')
+  fs.writeFileSync(a, 'v2')
+  rewind(s.file, { uuid: 'u2', mode: 'files' }, s.dir, new Date(T(50)))
+  assert.equal(fs.readFileSync(a, 'utf8'), 'v1')
+})
+
+test('途中で打ち切られた巻き戻し (情報が started のまま) は unfinished で 1 度だけ知らせ、枝の一覧には出さない', () => {
+  const s = twoFiles()
+  const out = rewind(s.file, s.spec, s.dir, new Date(T(30)))
+  const metaFile = path.join(s.dir, 'branches', `${out.id}.json`)
+  const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+  assert.equal(meta.state, 'done')
+  assert.equal(branches(s.dir).length, 1)
+  // 時間切れで node が止められると、情報は started のまま残る
+  fs.writeFileSync(metaFile, JSON.stringify({ ...meta, state: 'started' }))
+  assert.deepEqual(branches(s.dir), [])
+  const [u] = unfinished(s.dir)
+  assert.equal(u.id, out.id)
+  assert.equal(u.label, 'AskUserQuestion 色は?')
+  assert.deepEqual([...u.files].sort(), [s.w('a.ts'), s.w('o.md')].sort())
+  assert.equal(u.saved, path.join(s.dir, 'branches', `${out.id}.files`))
+  assert.equal(u.details, metaFile)
+  // コマンドの points は一覧と一緒に 1 度だけ知らせる
+  const run = () => JSON.parse(spawnSync(process.execPath, [SCRIPT, 'points', 'S'], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: s.base } }).stdout)
+  assert.deepEqual(run().unfinished.map(x => x.id), [out.id])
+  assert.deepEqual(run().unfinished, [])
+})
+
+// ---- 2 周目の指摘への対応 ----
+
+test('rewind: 作業フォルダの中で途中のフォルダがリンクなら、その下のファイルを書かずに断る', () => {
+  const s = twoFiles()
+  const sub = path.join(s.work, 'sub')
+  const k = path.join(sub, 'k.txt')
+  fs.mkdirSync(sub)
+  fs.writeFileSync(k, 'k 今')
+  writeSnap(s.dir, 'w3', { tool: 'Write', path: k, at: ms(8) + 3 }, 'k 前')
+  const fake = io({ lstatSync: (p, ...rest) => (p === sub ? { isSymbolicLink: () => true } : fs.lstatSync(p, ...rest)) })
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30)), fake), /^Error: Cannot restore .*k\.txt: the folder .*sub on its path is now a symbolic link \(or junction\)/)
+  s.unchanged()
+  assert.equal(fs.readFileSync(k, 'utf8'), 'k 今')
+})
+
+test('rewind: 本物のフォルダのリンク (Windows ではジャンクション) の下へは書かず、リンク先を書き換えない (作れない環境では飛ばす)', t => {
+  const s = twoFiles()
+  const outside = path.join(s.base, 'outside')
+  fs.mkdirSync(outside)
+  fs.writeFileSync(path.join(outside, 'k.txt'), '外')
+  try {
+    fs.symlinkSync(outside, path.join(s.work, 'sub'), 'junction')
+  } catch (err) {
+    t.skip(`フォルダのリンクを作れない (${err.code})`)
+    return
+  }
+  writeSnap(s.dir, 'w3', { tool: 'Write', path: path.join(s.work, 'sub', 'k.txt'), at: ms(8) + 3 }, 'k 前')
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30))), /the folder .*sub on its path is now a symbolic link/)
+  assert.equal(fs.readFileSync(path.join(outside, 'k.txt'), 'utf8'), '外')
+  s.unchanged()
+})
+
+test('rewind: 作業フォルダの外のファイルは、途中のフォルダを見ずにそのファイル自体だけを見る (元からリンクの場所で断らない)', () => {
+  const s = twoFiles()
+  const ext = path.join(s.base, 'ext')
+  const x = path.join(ext, 'x.txt')
+  fs.mkdirSync(ext)
+  fs.writeFileSync(x, 'x 今')
+  writeSnap(s.dir, 'w3', { tool: 'Write', path: x, at: ms(8) + 3 }, 'x 前')
+  // ext がリンクだと答えても (macOS の /tmp のような場所)、作業フォルダの外なので断らない
+  const fake = io({ lstatSync: (p, ...rest) => (p === ext ? { isSymbolicLink: () => true } : fs.lstatSync(p, ...rest)) })
+  const out = rewind(s.file, s.spec, s.dir, new Date(T(30)), fake)
+  assert.ok(out.restored.includes(x))
+  assert.equal(fs.readFileSync(x, 'utf8'), 'x 前')
+})
+
+test('rewind: 戻し終えた後で終わった印を書けなければ、書き戻さず、記録を書き換えたか (transcriptChanged) と戻した結果を付けて知らせる', () => {
+  const id = new Date(T(30)).toISOString().replace(/[:.]/g, '-')
+  // 終わった印 (state 'done') の書き込みだけを失敗させる
+  const failDone = dir =>
+    io({
+      writeFileSync: (p, d, ...rest) => {
+        if (p === path.join(dir, 'branches', `${id}.json`) && String(d).includes('"state":"done"')) throw enospc()
+        return fs.writeFileSync(p, d, ...rest)
+      },
+    })
+  const s = twoFiles()
+  assert.throws(() => rewind(s.file, s.spec, s.dir, new Date(T(30)), failDone(s.dir)), err => {
+    assert.match(err.message, /^The rewind finished, but could not record that it finished: .*\.json \(disk is full\)\. If \/better-rewind later says this rewind was stopped before it finished, you can ignore that$/)
+    assert.equal(err.transcriptChanged, true)
+    assert.deepEqual([...err.result.restored].sort(), [s.w('a.ts'), s.w('o.md')].sort())
+    assert.equal(err.result.transcriptChanged, true)
+    return true
+  })
+  // 記録は切れ、ファイルは戻ったまま (書き戻さない)。印は started のままなので、次に開いたとき知らせる
+  assert.notEqual(fs.readFileSync(s.file, 'utf8'), s.raw)
+  assert.equal(fs.readFileSync(s.w('a.ts'), 'utf8'), 'a 前')
+  assert.equal(fs.readFileSync(s.w('o.md'), 'utf8'), 'o 前')
+  assert.deepEqual(unfinished(s.dir).map(u => u.id), [id])
+
+  // ファイルだけ戻したときは、記録は書き換えていない
+  const f = twoFiles()
+  assert.throws(() => rewind(f.file, { uuid: 'u1', mode: 'files' }, f.dir, new Date(T(30)), failDone(f.dir)), err => {
+    assert.equal(err.transcriptChanged, false)
+    assert.equal(err.result.restored.length, 2)
+    return true
+  })
+  assert.equal(fs.readFileSync(f.file, 'utf8'), f.raw)
+  assert.equal(fs.readFileSync(f.w('a.ts'), 'utf8'), 'a 前')
+})
+
+test('fileRestorePlan: 拒否・失敗の結果でもファイルが変わっていた控え (ran) は使い、mod が結果を書けなかった控え (pending) は途中の版へ戻さない', () => {
+  const results = toolResults([
+    user('r', [
+      { type: 'tool_result', tool_use_id: 'late', content: 'denied after it ran', is_error: true },
+      { type: 'tool_result', tool_use_id: 'stop', content: 'interrupted', is_error: true },
+    ]),
+  ])
+  const snaps = [
+    { toolUseId: 'late', path: 'C:/x/a.ts', at: 1, existed: true, state: 'ran' },
+    { toolUseId: 'a2', path: 'C:/x/a.ts', at: 2, existed: true, state: 'ran' },
+    { toolUseId: 'stop', path: 'C:/x/b.ts', at: 1, existed: true, state: 'pending' },
+    { toolUseId: 'b2', path: 'C:/x/b.ts', at: 2, existed: true, state: 'ran' },
+  ]
+  const plan = fileRestorePlan(snaps, 1, results)
+  assert.deepEqual(plan.files.map(s => s.toolUseId), ['late'])
+  assert.deepEqual(plan.skipped.map(s => s.toolUseId), ['stop'])
+})
+
+test('settleDenied: 拒否・失敗でもファイルが控えから変わっていれば、大きいファイルの控えを消さずに ran にする。変わっていなければ中身ごと消す', () => {
+  const s = sandbox()
+  const sd = path.join(s.dir, 'snaps')
+  // mod は拒否・失敗の結果を見ると、中身を外した 'denied' の情報を書いてから drop を呼ぶ
+  const deny = id => {
+    const { data, ...rest } = JSON.parse(fs.readFileSync(path.join(sd, `${id}.json`), 'utf8'))
+    fs.writeFileSync(path.join(sd, `${id}.json`), JSON.stringify({ ...rest, state: 'denied' }))
+  }
+  const f = path.join(s.work, 'big.bin')
+  fs.writeFileSync(f, 'v0')
+  snap(s.dir, 'toolu_a', 'Write', f, 1, 'pending')
+  // 後段の hook がツールの実行後に断った: ファイルは変わっている
+  fs.writeFileSync(f, 'v1')
+  deny('toolu_a')
+  assert.deepEqual(settleDenied(s.dir, 'toolu_a'), { kept: 'toolu_a', state: 'ran' })
+  const [kept] = readSnaps(s.dir)
+  assert.equal(kept.state, 'ran')
+  assert.equal(kept.data, 'toolu_a.bin')
+  assert.equal(fs.readFileSync(path.join(sd, 'toolu_a.bin'), 'utf8'), 'v0')
+
+  // 本当に実行されなかった (変わっていない) なら中身ごと消す
+  const g = path.join(s.work, 'g.bin')
+  fs.writeFileSync(g, 'w0')
+  snap(s.dir, 'toolu_b', 'Write', g, 2, 'pending')
+  deny('toolu_b')
+  assert.deepEqual(settleDenied(s.dir, 'toolu_b'), { dropped: 'toolu_b' })
+  assert.deepEqual(fs.readdirSync(sd).filter(n => n.startsWith('toolu_b')), [])
+})
+
+test('points: Restore code の件数と名前に、地点の時点で無く今も無いファイルの「消す」は数えない (コマンドの points も)', () => {
+  const r = convo('C:/x')
+  const snaps = [
+    { toolUseId: 'w1', path: 'C:/x/n.md', at: ms(8) + 1, existed: false },
+    { toolUseId: 'w2', path: 'C:/x/o.md', at: ms(8) + 2, existed: true, data: 'w2.b64' },
+    { toolUseId: 'w3', path: 'C:/x/m.md', at: ms(8) + 3, existed: false },
+  ]
+  // 今あるのは m.md だけ (n.md は消すものが無い)
+  const [u1] = points(r, snaps, p => p === 'C:/x/m.md')
+  assert.equal(u1.restore.total, 2)
+  assert.deepEqual(u1.restore.files, [
+    { path: 'C:/x/o.md', action: 'write' },
+    { path: 'C:/x/m.md', action: 'delete' },
+  ])
+
+  const s = sandbox()
+  writeSnap(s.dir, 'w1', { tool: 'Write', path: path.join(s.work, 'n.md'), at: ms(8) + 1 })
+  const listed = JSON.parse(spawnSync(process.execPath, [SCRIPT, 'points', 'S'], { encoding: 'utf8', env: { ...process.env, CLAUDE_CONFIG_DIR: s.base } }).stdout).points
+  assert.equal(listed[0].restore.total, 0)
+  assert.deepEqual(listed[0].restore.files, [])
 })

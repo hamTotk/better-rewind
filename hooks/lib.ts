@@ -1,6 +1,6 @@
 import type { SessionMessage } from 'claude-code'
 
-import type { Branch, Direction, Mode, Point, RewindResult, SummarizeOutcome, SummarizeRequest } from '../types'
+import type { Branch, Direction, Mode, Point, RestorePlan, RewindResult, SummarizeOutcome, SummarizeRequest, Unfinished } from '../types'
 
 // 1 行に複数のツール呼び出しが乗ることがあるので、uuid に種類 (tool_use id) を足して一意にする
 export const pointKey = (p: Point) => `${p.uuid}:${p.toolUseId ?? p.kind}`
@@ -59,7 +59,46 @@ export function changesParts(c: Point['changes']): { text: string; added: string
 // 件数と名詞 (1 file / 2 files)
 export const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`
 
-export const BUSY = 'Cannot rewind while the AI is responding. Try again when it finishes'
+// Claude の応答中に断る文。巻き戻しと要約で言い分ける
+export const BUSY = 'Cannot rewind while Claude is responding. Try again when it finishes'
+export const BUSY_SUMMARIZE = 'Cannot summarize while Claude is responding. Try again when it finishes'
+
+// ファイルを見分けられる短い名前。ふつうはファイル名だけで、同じ名前が並ぶときは見分けられるまで親フォルダを
+// 前に足す (src/a.ts と test/a.ts)。区切りは / にそろえる
+export function shortNames(paths: readonly string[]): string[] {
+  const parts = paths.map(p => p.split(/[\\/]/).filter(Boolean))
+  return parts.map((ps, i) => {
+    for (let n = 1; n <= ps.length; n++) {
+      const tail = ps.slice(-n).join('/')
+      if (!parts.some((qs, j) => j !== i && qs.slice(-n).join('/') === tail)) return tail
+    }
+    return paths[i] ?? ''
+  })
+}
+
+// Restore code の確認画面に出す行: 何件のファイルをどう戻すか (地点より後の発言で変わったファイルも含む) と、戻さないファイル。
+// 件数は全部、名前は届いた分だけ (残りは「…and N more」)。戻すファイルと戻さないファイルを合わせて見分けられる名前にする
+export function restoreLines(r: RestorePlan): { lead: string; files: string[]; skipped: string | undefined } {
+  const lead =
+    r.total > 0
+      ? `Restore code puts back ${plural(r.total, 'file')} changed after this point, including by later prompts:`
+      : 'Restore code has nothing to put back from this point'
+  const shown = shortNames([...r.files.map(f => f.path), ...r.skipped])
+  const files = r.files.map((f, i) => (f.action === 'delete' ? `${shown[i]} (deleted: it did not exist at this point)` : (shown[i] ?? f.path)))
+  if (r.total > r.files.length) files.push(`…and ${r.total - r.files.length} more`)
+  const names = shown.slice(r.files.length).join(', ') + (r.skippedTotal > r.skipped.length ? ` and ${r.skippedTotal - r.skipped.length} more` : '')
+  const skipped = r.skippedTotal > 0 ? `Not restored, because no backup could be taken before an edit: ${names}` : undefined
+  return { lead, files, skipped }
+}
+
+// 途中で打ち切られた巻き戻しの知らせ (次に一覧を開いたとき 1 度だけ)
+export function unfinishedMessage(list: readonly Unfinished[]): string | undefined {
+  const u = list[0]
+  if (!u) return undefined
+  const more = list.length > 1 ? ` (and ${list.length - 1} more)` : ''
+  const files = u.files.length > 0 ? ` ${shortNames(u.files).join(', ')} may be only partly restored; their contents from before the rewind are in ${u.saved} (${u.details} lists which file is which)` : ''
+  return `A rewind to "${u.label}" was stopped before it finished${more}.${files}`
+}
 
 // 回答を選び直せる地点か (AskUserQuestion で質問が読める)
 export const isAsk = (p: Point) => p.tool === 'AskUserQuestion' && (p.questions?.length ?? 0) > 0
@@ -147,13 +186,16 @@ export function splitForSummary<M extends Message>(messages: readonly M[], r: Su
 export function summarizedMessage(direction: Direction, outcome: SummarizeOutcome | null): string {
   if (outcome?.kind === 'done') return direction === 'from' ? 'Summarized from here' : 'Summarized up to here'
   if (outcome?.kind === 'skip') return `Not summarized: ${outcome.reason}`
-  return 'Could not summarize from this point: /compact did not reach better-rewind (it may have summarized the whole conversation)'
+  // hook まで届かなかった: 地点で分けずに、会話全体が要約されたかもしれない
+  return 'Could not summarize from this point: the summary did not go through better-rewind, so it may have covered the whole conversation. Scroll up to check it'
 }
 
 // 巻き戻しを終えたときの一言
-export function doneMessage(mode: Mode, r: Pick<RewindResult, 'restored' | 'removed'>): string {
+export function doneMessage(mode: Mode, r: Pick<RewindResult, 'restored' | 'removed'> & Partial<Pick<RewindResult, 'skipped'>>): string {
   const parts = [mode === 'files' ? 'Code restored' : 'Rewound']
   if (mode !== 'conversation') parts.push(plural(r.restored.length + r.removed.length, 'file'))
+  const skipped = r.skipped ?? []
+  if (skipped.length > 0) parts.push(`not restored (no backup): ${shortNames(skipped).join(', ')}`)
   if (mode !== 'files') parts.push('see the previous conversation with /better-rewind branches')
   return parts.join(' · ')
 }
