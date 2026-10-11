@@ -22,7 +22,10 @@ import {
   summarizeRequest,
   summarizedMessage,
   unfinishedMessage,
+  groupKey,
+  listRows,
   windowAround,
+  windowRows,
 } from '../hooks/lib'
 
 const none = { files: [], added: 0, removed: 0 }
@@ -32,11 +35,21 @@ const QUESTIONS = [
   { question: '次は?', header: '進め方', multiSelect: false, options: [{ label: 'A' }, { label: 'B', description: 'B の説明' }] },
   { question: '色は?', multiSelect: false, options: [{ label: '赤' }, { label: '青' }] },
 ]
-// 一覧に出る地点は人の発言と AskUserQuestion の質問だけ (helper の points() と同じ)
+// 人の発言と AskUserQuestion の質問だけの一覧 (ツール呼び出しの入った一覧は TOOLS)
 const POINTS: Point[] = [
   { uuid: 'u1', kind: 'prompt', label: '色を聞いて', text: '色を聞いて', reply: '聞きます', changes: { files: ['C:\\x\\foo.ts', 'C:\\x\\bar.ts'], added: 12, removed: 3 }, canCut: true, restorable: false, restore: NOTHING },
   { uuid: 'u2', kind: 'prompt', label: 'foo を直して', text: 'foo を直して', reply: '▸ Edit foo.ts\n直しました', changes: { files: ['C:\\x\\foo.ts'], added: 3, removed: 1 }, canCut: true, restorable: true, restore: { total: 1, files: [{ path: 'C:\\x\\foo.ts', action: 'write' }], skippedTotal: 0, skipped: [] } },
   { uuid: 'a4', kind: 'tool', tool: 'AskUserQuestion', toolUseId: 't2', label: 'AskUserQuestion 次は?', reply: '▸ AskUserQuestion 次は?', questions: QUESTIONS, changes: none, canCut: true, restorable: false, restore: NOTHING },
+]
+// ツール呼び出しの入った一覧: 発言 → Read → Edit → 質問 → Bash → 発言
+const tool = (uuid: string, name: string, id: string, label: string): Point => ({ uuid, kind: 'tool', tool: name, toolUseId: id, label, reply: `▸ ${label}`, changes: none, canCut: true, restorable: false, restore: NOTHING })
+const TOOLS: Point[] = [
+  POINTS[0]!,
+  tool('b1', 'Read', 'r1', 'Read foo.ts'),
+  tool('b2', 'Edit', 'e1', 'Edit foo.ts'),
+  { ...POINTS[2]!, uuid: 'b3', toolUseId: 'q1' },
+  tool('b4', 'Bash', 'x1', 'Bash npm test'),
+  POINTS[1]!,
 ]
 const BRANCHES: Branch[] = [
   { id: '2026-10-10T05-03-00-000Z', at: '2026-10-10T05:03:00.000Z', label: 'foo を直して', mode: 'both', answered: false, text: '❯ foo を直して\n\n▸ Edit foo.ts\n\n直しました\n\n❯ 次\n\nはい' },
@@ -221,6 +234,76 @@ describe('一覧ペイン', () => {
     await $.command.run(run('better-rewind'))
     const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
     expect(await ui.find({ type: 'Text', text: 'Could not load: transcript not found: S' })).toBeDefined()
+  })
+})
+
+describe('ツール呼び出しの畳み', () => {
+  // 質問で区切られて 2 つのまとまりになる (Read と Edit / Bash)
+  const g1 = groupKey(TOOLS[1]!)
+
+  test('ツール呼び出しは続くものを 1 行に畳んで 2 段字下げし、Enter で開いて 1 行ずつ並べ、もう一度で畳む', async ($, on) => {
+    engine(on, { points: { points: TOOLS } })
+    const { text } = await $.command.run(run('better-rewind'))
+    expect(text).toStartWith('Opened 6 rewind points')
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    expect(await ui.find({ type: 'Text', text: '▸ 2 tool calls' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '▸ 1 tool call' })).toBeDefined()
+    expect(await ui.find({ key: pointKey(TOOLS[1]!) })).toBeUndefined()
+    // 発言は字下げなし、質問は 1 段、まとまりは 2 段で上の行に付ける
+    expect((await ui.find({ key: `row:${pointKey(TOOLS[0]!)}` }))?.props).toMatchObject({ paddingLeft: 0 })
+    expect((await ui.find({ key: `row:${g1}` }))?.props).toMatchObject({ paddingLeft: 8, marginTop: 0 })
+    expect((await ui.find({ key: `row:${pointKey(TOOLS[3]!)}` }))?.props).toMatchObject({ paddingLeft: 4, marginTop: 1 })
+
+    // まとまりにカーソル: プレビューは中のツール呼び出し、案内は開き方
+    await $.ui.focus({ component: 'Pane', requestId: 'better-rewind', element: g1, origin: { kind: 'person' } })
+    expect((await ui.find({ key: g1 }))?.props).toMatchObject({ label: '❯' })
+    expect((await ui.find({ type: 'Markdown' }))?.props).toMatchObject({ text: '▸ Read foo.ts\n▸ Edit foo.ts' })
+    expect(await ui.find({ type: 'Text', text: /Enter to show tool calls/ })).toBeDefined()
+
+    // Enter で開く。カーソルはまとまりの行に残る
+    await ui.press({ key: g1 })
+    expect(await ui.find({ type: 'Text', text: '▾ 2 tool calls' })).toBeDefined()
+    expect((await ui.find({ key: `row:${pointKey(TOOLS[1]!)}` }))?.props).toMatchObject({ paddingLeft: 8, marginTop: 0 })
+    expect(await ui.find({ key: pointKey(TOOLS[2]!) })).toBeDefined()
+    expect(await ui.find({ key: pointKey(TOOLS[4]!) })).toBeUndefined()
+    expect((await ui.find({ key: g1 }))?.props).toMatchObject({ label: '❯' })
+    expect(await ui.find({ type: 'Text', text: /Enter to hide tool calls/ })).toBeDefined()
+
+    // もう一度で畳む
+    await ui.press({ key: g1 })
+    expect(await ui.find({ key: pointKey(TOOLS[1]!) })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('ツール呼び出しの地点でも戻し方を選べ、その呼び出しの直前で切る。入力欄には何も戻さない', async ($, on) => {
+    const seen = engine(on, { points: { points: TOOLS }, rewind: REWOUND })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: g1 })
+    await $.ui.focus({ component: 'Pane', requestId: 'better-rewind', element: pointKey(TOOLS[2]!), origin: { kind: 'person' } })
+    expect((await ui.find({ type: 'Markdown' }))?.props).toMatchObject({ text: '▸ Edit foo.ts' })
+    await ui.press({ key: pointKey(TOOLS[2]!) })
+    expect(await ui.find({ type: 'Text', text: 'Rewind to just before "Edit foo.ts"' })).toBeDefined()
+    await ui.press({ key: 'mode:conversation' })
+    expect(rewinds(seen)).toEqual([{ uuid: 'b2', toolUseId: 'e1', label: 'Edit foo.ts', mode: 'conversation' }])
+    expect(seen.commands).toEqual(['/resume S'])
+    expect(seen.filled).toEqual([])
+    expect(seen.submitted).toEqual([])
+  })
+
+  test('/rewind は組み込みの画面へ進まずに一覧を開き、開くたびにツール呼び出しを畳む', async ($, on) => {
+    const seen = engine(on, { points: { points: TOOLS } })
+    await $.command.run(run('better-rewind'))
+    const ui = await $.ui.mount({ plugin: 'better-rewind', surface: 'terminal', ...PANE })
+    await ui.press({ key: g1 })
+    expect(await ui.find({ key: pointKey(TOOLS[1]!) })).toBeDefined()
+
+    const { text } = await $.command.run(run('rewind'))
+    expect(text).toStartWith('Opened 6 rewind points')
+    // 組み込みの /rewind (テストではこの下の command.run) には届かない
+    expect(seen.commands).toEqual([])
+    expect(await ui.find({ key: pointKey(TOOLS[1]!) })).toBeUndefined()
+    expect((await ui.find({ key: 'current' }))?.props).toMatchObject({ label: '❯' })
   })
 })
 
@@ -681,6 +764,24 @@ describe('巻き戻す前の会話', () => {
 })
 
 describe('表示の計算', () => {
+  test('listRows はツール呼び出しを続くまとまりに畳み、開いたまとまりだけ中を並べる', () => {
+    const [p1, read, , ask, bash, p2] = TOOLS as [Point, Point, Point, Point, Point, Point]
+    expect(listRows(TOOLS, []).map(r => r.key)).toEqual([pointKey(p1), groupKey(read), pointKey(ask), groupKey(bash), pointKey(p2), 'current'])
+    expect(listRows(TOOLS, [groupKey(bash)]).map(r => r.key)).toEqual([pointKey(p1), groupKey(read), pointKey(ask), groupKey(bash), pointKey(bash), pointKey(p2), 'current'])
+    expect(listRows([], []).map(r => r.key)).toEqual(['current'])
+  })
+
+  test('windowRows は行の高さ (発言・質問 2 行、まとまり 1 行、上の空き) で収め、先頭の行の上の空きは数えない', () => {
+    const rows = listRows(TOOLS, [])
+    expect(windowRows(rows, 5, 100)).toEqual([0, 6])
+    // 発言 2 行 + 付いたまとまり 1 行
+    expect(windowRows(rows, 0, 3)).toEqual([0, 2])
+    // (現在) 1 行 + その上の空き + 発言 2 行
+    expect(windowRows(rows, 5, 4)).toEqual([4, 6])
+    // 収まらなくてもカーソルの行は出す
+    expect(windowRows(rows, 2, 1)).toEqual([2, 3])
+  })
+
   test('windowAround はカーソルを中央に置き、端では詰める', () => {
     expect(windowAround(0, 10, 4)).toEqual([0, 4])
     expect(windowAround(5, 10, 4)).toEqual([3, 7])

@@ -61,11 +61,13 @@ const rows = linked([
   ai('a5', [{ type: 'text', text: '次の返答' }]),
 ])
 
-test('points は人の発言と AskUserQuestion を順に拾い、ほかのツール呼び出し・AI の文章・結果・meta・subagent・コマンド出力・/compact は拾わない', () => {
+test('points は人の発言とツール呼び出し (質問を含む) を順に拾い、AI の文章・結果・meta・subagent・コマンド出力・/compact は拾わない', () => {
   assert.deepEqual(
     points(rows).map(p => `${p.uuid}:${p.kind}:${p.label}`),
-    ['u1:prompt:色を聞いて', 'a2:tool:AskUserQuestion 好きな色は?', 'u2:prompt:次'],
+    ['u1:prompt:色を聞いて', 'a2:tool:AskUserQuestion 好きな色は?', 'a3:tool:Edit foo.ts', 'u2:prompt:次'],
   )
+  // 質問だけが回答を選び直すための質問を持つ
+  assert.deepEqual(points(rows).map(p => p.questions?.length ?? 0), [0, 1, 0, 0])
 })
 
 test('points: 要約の跡 (/compact の行と要約の本文の行) は地点にせず、返答の区切りにもしない。ほかのコマンドは地点のまま', () => {
@@ -93,10 +95,11 @@ test('質問の地点は tool_use id と結果の行を持つ', () => {
   assert.equal(ask.resultUuid, 'r1')
 })
 
-test('返答はその地点から次の人の発言の手前まで。地点にしないツールも ▸ の 1 行で並ぶ', () => {
+test('返答はその地点から次の人の発言の手前まで。ツール呼び出しは ▸ の 1 行で並ぶ', () => {
   const byUuid = Object.fromEntries(points(rows).map(p => [p.uuid, p.reply]))
   assert.equal(byUuid.u1, '聞きます\n▸ AskUserQuestion 好きな色は?\n▸ Edit foo.ts\n赤ですね')
   assert.equal(byUuid.a2, '▸ AskUserQuestion 好きな色は?\n▸ Edit foo.ts\n赤ですね')
+  assert.equal(byUuid.a3, '▸ Edit foo.ts\n赤ですね')
   assert.equal(byUuid.u2, '次の返答')
 })
 
@@ -120,12 +123,12 @@ test('捨てられた枝は拾わず、最後に書かれた行から辿った�
     user('new', '言い直し', { parentUuid: 'r2' }),
   ]
   assert.deepEqual(activeRows(rows).map(r => r.uuid), ['u1', 'a1', 'a2', 'r1', 'r2', 'new'])
-  // 兄弟の枝に分かれた並列の呼び出しも返答のプレビューに出る
-  assert.deepEqual(points(rows).map(p => p.label), ['最初', '言い直し'])
+  // 兄弟の枝に分かれた並列の呼び出しは最初の 1 つだけが地点になり、残りも返答のプレビューに出る
+  assert.deepEqual(points(rows).map(p => p.label), ['最初', 'Read a.md', '言い直し'])
   assert.equal(points(rows)[0].reply, '▸ Read a.md\n▸ Read b.md')
 })
 
-test('points: 並列の呼び出しの 2 つ目にある質問は地点にしない (途中で切ると結果の無い呼び出しが残る)。1 つ目の質問は地点にする', () => {
+test('points: 並列の呼び出しは最初の 1 つだけを地点にする (途中で切ると結果の無い呼び出しが残る)。2 つ目にある質問は地点にしない', () => {
   const ask = (id, q) => ({ type: 'tool_use', id, name: 'AskUserQuestion', input: { questions: [{ question: q }] } })
   const rows = linked([
     user('u1', '始めて'),
@@ -138,7 +141,7 @@ test('points: 並列の呼び出しの 2 つ目にある質問は地点にしな
     user('r3', [{ type: 'tool_result', tool_use_id: 'q2', content: 'はい' }]),
     user('r4', [{ type: 'tool_result', tool_use_id: 't2', content: 'B' }]),
   ])
-  assert.deepEqual(points(rows).map(p => p.label), ['始めて', 'AskUserQuestion 先の質問'])
+  assert.deepEqual(points(rows).map(p => p.label), ['始めて', 'Read a.md', 'AskUserQuestion 先の質問'])
   assert.equal(points(rows)[0].reply, '▸ Read a.md\n▸ AskUserQuestion 後ろの質問\n▸ AskUserQuestion 先の質問\n▸ Read b.md')
 })
 
@@ -223,7 +226,7 @@ const at = (rows, uuid) => rows.findIndex(r => r.uuid === uuid)
 test('cutPlan: 人の発言はその親が先端、考えるだけの行は先端にせず、並列の途中は最初の呼び出しへ寄せる', () => {
   const r = convo()
   assert.deepEqual(cutPlan(r, { uuid: 'u2' }), { cutIndex: at(r, 'u2'), leafUuid: 'a7', append: [], since: ms(11) })
-  // 一覧の地点は質問だけだが、cutPlan はどのツール呼び出しの id でも切る位置を決められる
+  // ツール呼び出しはその行の親が先端
   assert.deepEqual(cutPlan(r, { uuid: 'a2', toolUseId: 'e1' }), { cutIndex: at(r, 'a2'), leafUuid: 'a1', append: [], since: ms(3) })
   assert.deepEqual(cutPlan(r, { uuid: 'a4', toolUseId: 'q1' }), { cutIndex: at(r, 'a3'), leafUuid: 'r1', append: [], since: ms(5) })
   assert.deepEqual(cutPlan(r, { uuid: 'a6', toolUseId: 'w2' }), { cutIndex: at(r, 'a5'), leafUuid: 'r2', append: [], since: ms(8) })
@@ -261,12 +264,12 @@ test('points: 会話を戻せるかと、地点より後に取った控えがあ
   const r = convo()
   const snaps = [{ path: 'C:/x/n.md', at: ms(8) + 5, existed: false }]
   const list = points(r, snaps)
-  assert.deepEqual(list.map(p => p.label), ['直して', 'AskUserQuestion 色は?', '次'])
-  assert.deepEqual(list.map(p => p.canCut), [false, true, true])
-  assert.deepEqual(list.map(p => p.restorable), [true, true, false])
-  assert.deepEqual(list[1].questions, QUESTIONS)
+  assert.deepEqual(list.map(p => p.label), ['直して', 'Edit a.ts', 'AskUserQuestion 色は?', 'Write n.md', '次'])
+  assert.deepEqual(list.map(p => p.canCut), [false, true, true, true, true])
+  assert.deepEqual(list.map(p => p.restorable), [true, true, true, true, false])
+  assert.deepEqual(list[2].questions, QUESTIONS)
   // 控えが地点より前にしか無ければ、戻せるファイルは無い
-  assert.deepEqual(points(r, [{ path: 'C:/x/a.ts', at: ms(3) + 1, existed: true }]).map(p => p.restorable), [true, false, false])
+  assert.deepEqual(points(r, [{ path: 'C:/x/a.ts', at: ms(3) + 1, existed: true }]).map(p => p.restorable), [true, true, false, false, false])
 })
 
 test('fileRestorePlan は時刻以降の控えのうち、ファイルごとに最初のものを選ぶ', () => {
@@ -512,7 +515,7 @@ test('コマンドとして: rewind は spec を stdin で受け、失敗は JSO
   const listed = JSON.parse(run(['branches', 'S']).stdout).branches
   assert.equal(listed.length, 1)
   const after = JSON.parse(run(['points', 'S']).stdout).points
-  assert.deepEqual(after.map(p => p.label), ['直して', 'AskUserQuestion 色は?'])
+  assert.deepEqual(after.map(p => p.label), ['直して', 'Edit a.ts', 'AskUserQuestion 色は?', 'Write n.md'])
   assert.match(JSON.parse(run(['points', '../x']).stdout).error, /Invalid session id/)
 })
 
@@ -538,7 +541,9 @@ const withDangling = dir => {
 
 test('assertCuttable: 今の会話に元からある結果の無い呼び出しは咎めず、その後ろの地点も戻せる', () => {
   const r = withDangling()
-  assert.deepEqual(points(r).map(p => p.canCut), [false, true, true])
+  // 結果の無い Bash の地点 (z) も、その前で切れば欠けが残らないので戻せる
+  assert.deepEqual(points(r).map(p => p.label), ['直して', 'Edit a.ts', 'AskUserQuestion 色は?', 'Write n.md', 'Bash sleep 99', '次'])
+  assert.deepEqual(points(r).map(p => p.canCut), [false, true, true, true, true, true])
   assert.doesNotThrow(() => assertCuttable(r, cutPlan(r, { uuid: 'u2' })))
   const s = sandbox(withDangling)
   const out = rewind(s.file, { uuid: 'u2', mode: 'conversation' }, s.dir, new Date(T(30)))
@@ -570,7 +575,7 @@ test('points: restore は Restore code が戻すファイル (後の発言の分
     { toolUseId: 'e9', path: 'C:/x/a.ts', at: ms(12), existed: false, state: 'pending', failed: true },
     { toolUseId: 'e10', path: 'C:/x/p.md', at: ms(12) + 1, existed: true, state: 'ran', data: 'e10.b64' },
   ]
-  const [u1, ask, u2] = points(r, snaps)
+  const [u1, , ask, , u2] = points(r, snaps)
   assert.deepEqual(u1.restore, {
     total: 3,
     files: [
@@ -607,7 +612,7 @@ test('rewind: 拒否・失敗した呼び出しの控え (記録の結果がエ�
   fs.writeFileSync(o, '人が後で書いた')
   writeSnap(s.dir, 'w2', { tool: 'Write', path: o, at: ms(8) + 2 }, 'o 前')
   writeSnap(s.dir, 'w1', { tool: 'Write', path: path.join(s.work, 'n.md'), at: ms(8) + 1, state: 'denied' })
-  assert.deepEqual(points(fileRows(s.file), readSnaps(s.dir)).map(p => p.restorable), [false, false, false])
+  assert.deepEqual(points(fileRows(s.file), readSnaps(s.dir)).map(p => p.restorable), [false, false, false, false, false])
   assert.throws(() => rewind(s.file, { uuid: 'u1', mode: 'files' }, s.dir, new Date(T(30))), /^Error: No file backups to restore$/)
   assert.equal(fs.readFileSync(o, 'utf8'), '人が後で書いた')
 })

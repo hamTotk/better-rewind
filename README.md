@@ -1,14 +1,15 @@
 # better-rewind
 
-A Claude Code mod that lets you rewind or summarize from any of your prompts, or from any question Claude asked you with AskUserQuestion.
+A Claude Code mod that lets you rewind or summarize from any of your prompts, any tool call, or any question Claude asked you with AskUserQuestion.
 
 The built-in `/rewind` goes back to one of your prompts. better-rewind adds a few things to that:
 
+- **Rewind to a tool call:** go back to just before any tool call in a reply, not only to your prompts.
 - **Re-answer a question:** go back to just after one of Claude's AskUserQuestion questions and pick a different answer. Claude then carries on from the new answer by itself.
 - **Preview the reply:** see the reply that followed each point before you choose it.
 - **Keep the old branch:** the conversation you rewound away is saved, and `/better-rewind branches` lets you read it.
 
-It does not replace `/rewind`; it adds its own command, `/better-rewind`.
+It replaces the `/rewind` command and adds its own command, `/better-rewind`. Pressing Esc twice still opens the built-in Rewind; see [Open it with a key](#open-it-with-a-key).
 
 [日本語の説明は下にあります](#日本語)
 
@@ -26,10 +27,12 @@ To remove it: `claude plugin uninstall better-rewind`.
 
 ## Use
 
-- `/better-rewind` opens the list of points: each of your prompts, and each AskUserQuestion question (indented under its prompt). Other tool calls are not listed; they show as `▸ Tool` lines in the reply preview.
+- `/rewind` or `/better-rewind` opens the list of points: each of your prompts, each AskUserQuestion question (indented under its prompt), and the other tool calls (indented one step further).
+- Tool calls in a row are folded into one line, such as `▸ 3 tool calls`. Press `Enter` on that line to show them, and again to fold them. Each time the list opens, they start folded. (Space cannot do this: the pane does not receive it.)
+- When Claude ran several tools at once, only the first is listed: rewinding to the middle of them would leave a call without its result.
 - `↑` / `↓` select a point, and the reply that followed it is shown below. `Enter` chooses it; `Esc` closes the pane.
 - Then pick what to do. The wording and order follow the built-in Rewind:
-  - **Restore code and conversation**, **Restore conversation**, **Restore code**: go back to just before the point. When the conversation is rewound to one of your prompts, that prompt is put back in the input field (**Restore code** alone leaves the conversation and the input field as they are).
+  - **Restore code and conversation**, **Restore conversation**, **Restore code**: go back to just before the point. When the conversation is rewound to one of your prompts, that prompt is put back in the input field (**Restore code** alone leaves the conversation and the input field as they are). When it is rewound to a tool call, Claude's reply stops just before that call and you type what comes next.
   - **Restore code** puts back every file that changed after the point, including changes made after later prompts. Before you choose, the pane lists how many files that is and their names, and any file it cannot restore.
   - On a question point, the conversation choices read **…, then re-answer**. You choose an answer for each question (one of the options, or your own), and Claude continues from it.
   - **Summarize from here**: replace the point and everything after it with a summary; earlier messages stay as they are.
@@ -39,8 +42,25 @@ To remove it: `claude plugin uninstall better-rewind`.
 - `/better-rewind branches` lists the conversations you rewound away, newest first, read-only.
 - Nothing is rewound or summarized while Claude is responding; the pane says so.
 
+### Open it with a key
+
+Pressing Esc twice opens the built-in Rewind, and a mod cannot change that: Claude Code opens it without going through any hook. You can give better-rewind a key of its own instead. Add this to `~/.claude/keybindings.json` (create the file if it does not exist; if it does, add the line to its `"Chat"` block):
+
+```json
+{
+  "bindings": [
+    { "context": "Chat", "bindings": { "alt+r": "command:better-rewind" } }
+  ]
+}
+```
+
+Claude Code does not use Alt+R for anything else. Your terminal may take some keys before Claude Code sees them; if Alt+R does nothing, pick another free key, such as `ctrl+q` or `ctrl+x ctrl+r`.
+
+You could bind `"escape escape"` instead, but then a single Esc no longer stops Claude while it is responding (Claude Code waits up to 3 seconds for the second Esc and drops the first). Ctrl+C still stops it.
+
 ## How it works
 
+- **`/rewind`:** the mod answers the `/rewind` command itself, so the built-in Rewind does not open. If better-rewind cannot open its list, the built-in Rewind opens instead.
 - **Conversation:** the mod cuts the session's transcript (`~/.claude/projects/<project>/<session>.jsonl`) at the point and reloads the same session with `/resume`. No new session is created. The full transcript from before the cut is saved first.
 - **Code:** just before each Edit, Write or NotebookEdit, the mod saves the file as it was (or notes that it did not exist), then notes whether the call actually ran. Restoring puts every file changed after the point back to that state, and removes files that were created after it. Changes made through Bash are not tracked, and edits made before the mod was installed cannot be restored.
   - A call you declined, or one that failed, is not used: the mod never writes a file through a call that did not run, and it clears the copy it took of that file. If the file changed anyway (the call was stopped after it had already written, or stopped partway), the copy is kept and used like any other edit, so the file is not put back to an in-between version.
@@ -80,15 +100,16 @@ MIT
 
 ## 日本語
 
-自分の発言と、Claude が AskUserQuestion で聞いてきた質問のどこからでも、会話とコードを戻したり要約したりできる Claude Code の mod です。
+自分の発言、ツール呼び出し、Claude が AskUserQuestion で聞いてきた質問のどこからでも、会話とコードを戻したり要約したりできる Claude Code の mod です。
 
 組み込みの `/rewind` は自分の発言の地点に戻れます。better-rewind はそれに次のことを足します。
 
+- **ツール呼び出しへの巻き戻し:** 自分の発言だけでなく、返答の途中のツール呼び出しの直前にも戻れます。
 - **質問への回答のやり直し:** Claude が AskUserQuestion で聞いてきた質問の直後に戻り、別の回答を選べます。選ぶと Claude が新しい回答で自動的に続きを始めます。
 - **返答のプレビュー:** 地点を選ぶ前に、その地点の後に続いた返答を見られます。
 - **戻す前の会話を残す:** 巻き戻して捨てた会話は保存され、`/better-rewind branches` で読めます。
 
-組み込みの `/rewind` は置き換えません。専用のコマンド `/better-rewind` で使います。
+`/rewind` コマンドを置き換え、専用のコマンド `/better-rewind` も足します。Esc を 2 回押したときは組み込みの Rewind が開きます ([キーで開く](#キーで開く) を参照)。
 
 ### 入れ方
 
@@ -104,10 +125,12 @@ MIT
 
 ### 使い方
 
-- `/better-rewind` で地点の一覧が開きます。地点は自分の発言と、AskUserQuestion の質問 (発言の下に字下げして表示) です。ほかのツール呼び出しは一覧に出ず、返答のプレビューに `▸ ツール名` の 1 行で出ます。
+- `/rewind` か `/better-rewind` で地点の一覧が開きます。地点は自分の発言、AskUserQuestion の質問 (発言の下に字下げして表示)、ほかのツール呼び出し (さらに 1 段字下げして表示) です。
+- 続けて並ぶツール呼び出しは `▸ 3 tool calls` のような 1 行に畳まれています。その行で Enter を押すと開き、もう一度押すと畳みます。一覧を開くたびに畳んだ状態から始まります (Space はペインに届かないので使えません)。
+- Claude が複数のツールを同時に呼んだときは、最初の 1 つだけが一覧に出ます。途中に戻すと、結果の無い呼び出しが残ってしまうためです。
 - ↑ / ↓ で地点を選ぶと、その後に続いた返答が下に出ます。Enter で決定、Esc で閉じます。
 - 続けて何をするかを選びます。言葉と並びは組み込みの Rewind に合わせて英語です。
-  - **Restore code and conversation** / **Restore conversation** / **Restore code:** 地点の直前に戻します。会話を自分の発言の地点に戻すと、その発言が入力欄に戻ります (**Restore code** だけのときは、会話も入力欄もそのままです)。
+  - **Restore code and conversation** / **Restore conversation** / **Restore code:** 地点の直前に戻します。会話を自分の発言の地点に戻すと、その発言が入力欄に戻ります (**Restore code** だけのときは、会話も入力欄もそのままです)。ツール呼び出しの地点に戻すと、Claude の返答がその呼び出しの直前で止まり、続きは自分で打ちます。
   - **Restore code** は、地点より後に変わったファイルをすべて戻します。後の発言で変わったファイルも含みます。選ぶ前の画面に、戻すファイルの数と名前、戻せないファイルが出ます。
   - 質問の地点では、会話を戻す選択肢が「…, then re-answer」になります。質問ごとに回答 (選択肢か自分で書いた文) を選ぶと、Claude がその回答で続けます。
   - **Summarize from here:** 地点から後ろを要約に置き換えます。地点より前はそのまま残ります。
@@ -117,8 +140,25 @@ MIT
 - `/better-rewind branches` で、巻き戻して捨てた会話を新しい順に読めます (読むだけです)。
 - Claude が応答している間は戻さず、要約もしません (画面に理由を出します)。
 
+### キーで開く
+
+Esc を 2 回押すと組み込みの Rewind が開き、これは mod からは変えられません (Claude Code が hook を通さずに開くため)。代わりに、better-rewind を開くキーを割り当てられます。`~/.claude/keybindings.json` に次を書いてください (ファイルが無ければ作り、あればその `"Chat"` の欄に 1 行足します)。
+
+```json
+{
+  "bindings": [
+    { "context": "Chat", "bindings": { "alt+r": "command:better-rewind" } }
+  ]
+}
+```
+
+Alt+R は Claude Code のほかの機能では使われていません。端末が先にキーを使うことがあるので、Alt+R で開かなければ `ctrl+q` や `ctrl+x ctrl+r` などほかの空いているキーにしてください。
+
+`"escape escape"` に割り当てることもできますが、そうすると Claude の応答中に Esc を 1 回押しても止まらなくなります (Claude Code が 2 回目の Esc を最大 3 秒待ち、1 回目を捨てるため)。Ctrl+C では止まります。
+
 ### 仕組み
 
+- **`/rewind`:** mod が `/rewind` コマンドに自分で答えるので、組み込みの Rewind は開きません。better-rewind が一覧を開けなかったときは、組み込みの Rewind が開きます。
 - **会話:** セッションの記録ファイル (`~/.claude/projects/<project>/<session>.jsonl`) を地点で切り、同じセッションを `/resume` で読み直します。新しいセッションは増えません。切る前の記録は先に丸ごと保存します。
 - **コード:** Edit・Write・NotebookEdit の直前に、対象のファイルの中身 (無ければ「無かった」こと) を控え、その呼び出しが実際に実行されたかも書き足します。戻すときは、地点より後に変わったファイルを控えの状態に戻し、地点より後に作られたファイルは消します。Bash で変わったファイルと、mod を入れる前の編集は戻せません。
   - 拒否した呼び出しと失敗した呼び出しの控えは使いません。実行されなかった呼び出しを通してファイルを書くことはなく、その控えの中身も消します。ただし、それでもファイルが変わっていたとき (書いた後で止められた、途中で止まった) は控えを残し、ふつうの編集と同じく戻すのに使います。ファイルを途中の版へ戻さないためです。

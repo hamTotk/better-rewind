@@ -1,11 +1,11 @@
 {
   "name": "better-rewind",
-  "version": "1.1.0",
-  "description": "Rewind or summarize from any prompt or AskUserQuestion answer, with a reply preview and saved branches",
+  "version": "1.2.0",
+  "description": "Rewind or summarize from any prompt, tool call or AskUserQuestion answer, with a reply preview and saved branches",
   "author": { "name": "hamTotk" },
   "homepage": "https://github.com/hamTotk/better-rewind",
   "repository": "https://github.com/hamTotk/better-rewind",
   "license": "MIT",
-  "keywords": ["rewind", "summarize", "AskUserQuestion", "mod"],
+  "keywords": ["rewind", "summarize", "AskUserQuestion", "tool call", "mod"],
   "types": "./types/index.d.ts"
 }

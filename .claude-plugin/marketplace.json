@@ -1,12 +1,12 @@
 {
   "name": "better-rewind",
   "owner": { "name": "hamTotk" },
-  "description": "better-rewind: rewind or summarize from any prompt or AskUserQuestion answer",
+  "description": "better-rewind: rewind or summarize from any prompt, tool call or AskUserQuestion answer",
   "plugins": [
     {
       "name": "better-rewind",
       "source": "./",
-      "description": "Rewind or summarize from any prompt or AskUserQuestion answer, with a reply preview and saved branches"
+      "description": "Rewind or summarize from any prompt, tool call or AskUserQuestion answer, with a reply preview and saved branches"
     }
   ]
 }

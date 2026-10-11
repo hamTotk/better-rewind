@@ -103,6 +103,73 @@ export function unfinishedMessage(list: readonly Unfinished[]): string | undefin
 // 回答を選び直せる地点か (AskUserQuestion で質問が読める)
 export const isAsk = (p: Point) => p.tool === 'AskUserQuestion' && (p.questions?.length ?? 0) > 0
 
+// ---- 一覧の行 ----
+
+// 一覧の最後の「(現在)」の key。選ぶと巻き戻さずに閉じる
+export const CURRENT = 'current'
+
+// 一覧の 1 行。人の発言と質問は地点の行。ほかのツール呼び出しは、続けて並ぶものを 1 つのまとまり (group) に畳み、
+// 開いたまとまりは自分の下に地点の行として並べる。depth は字下げの段 (人の発言 0・質問 1・ほかのツール呼び出し 2)
+export type Row =
+  | { kind: 'point'; key: string; point: Point; depth: number }
+  | { kind: 'group'; key: string; tools: Point[]; isOpen: boolean }
+  | { kind: 'current'; key: string }
+
+export const depthOf = (p: Point) => (p.kind === 'prompt' ? 0 : isAsk(p) ? 1 : 2)
+
+// まとまりの key は先頭の呼び出しで決める (一覧を読み直しても、先頭が同じなら開いたまま)
+export const groupKey = (first: Point) => `tools:${pointKey(first)}`
+
+export function listRows(list: readonly Point[], expanded: readonly string[]): Row[] {
+  const rows: Row[] = []
+  for (let i = 0; i < list.length; ) {
+    const p = list[i] as Point
+    if (depthOf(p) < 2) {
+      rows.push({ kind: 'point', key: pointKey(p), point: p, depth: depthOf(p) })
+      i++
+      continue
+    }
+    let j = i
+    while (j < list.length && depthOf(list[j] as Point) === 2) j++
+    const tools = list.slice(i, j)
+    const key = groupKey(p)
+    const isOpen = expanded.includes(key)
+    rows.push({ kind: 'group', key, tools, isOpen })
+    if (isOpen) for (const t of tools) rows.push({ kind: 'point', key: pointKey(t), point: t, depth: 2 })
+    i = j
+  }
+  rows.push({ kind: 'current', key: CURRENT })
+  return rows
+}
+
+// 行の高さ: 人の発言と質問は 2 行 (内容と変わったファイル)、ツール呼び出しとまとまりは 1 行
+export const rowLines = (r: Row) => (r.kind === 'point' && r.depth < 2 ? 2 : 1)
+// 行の上の空き: ツール呼び出しとまとまりは上の行に付けて詰める。ほかは 1 行空ける (組み込みと同じ間隔)
+export const rowGap = (r: Row) => (r.kind === 'group' || (r.kind === 'point' && r.depth === 2) ? 0 : 1)
+
+// カーソルの行から上下に交互に広げて、lines 行に収まる表示範囲 [start, end)。先頭の行の上の空きは描かないので数えない
+export function windowRows(rows: readonly Row[], index: number, lines: number): [number, number] {
+  const at = (i: number) => rows[i] as Row
+  let start = index
+  let end = index + 1
+  let used = rowLines(at(index))
+  for (let grew = true; grew; ) {
+    grew = false
+    if (end < rows.length && used + rowGap(at(end)) + rowLines(at(end)) <= lines) {
+      used += rowGap(at(end)) + rowLines(at(end))
+      end++
+      grew = true
+    }
+    // 上に足すと、それまで先頭だった行の上の空きも描かれる
+    if (start > 0 && used + rowLines(at(start - 1)) + rowGap(at(start)) <= lines) {
+      used += rowLines(at(start - 1)) + rowGap(at(start))
+      start--
+      grew = true
+    }
+  }
+  return [start, end]
+}
+
 // 戻し方の選択肢の key。要約の 2 つは組み込みの値に合わせる
 export type OptionKey = Mode | 'summarize' | 'summarize_up_to' | 'cancel'
 

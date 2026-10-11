@@ -6,6 +6,7 @@ import type { OptionKey } from './lib'
 import {
   BUSY,
   BUSY_SUMMARIZE,
+  CURRENT,
   branchLines,
   changesParts,
   clipToRows,
@@ -13,20 +14,26 @@ import {
   editedFile,
   isAsk,
   isMissing,
+  listRows,
   modeOptions,
   plural,
   pointKey,
   restoreLines,
+  rowGap,
   snapName,
   splitForSummary,
   summarizeRequest,
   summarizedMessage,
   unfinishedMessage,
   windowAround,
+  windowRows,
 } from './lib'
 
-// /better-rewind で巻き戻し地点 (人の発言と AskUserQuestion の質問) の一覧ペインを開く。見た目は組み込みの Rewind 画面に寄せる:
-// 1 地点 2 行 (内容と、そこから次の人の発言までに変わったファイルの要約)、選択中は ❯ と suggestion 色、最後に (現在)。
+// /better-rewind (と、置き換えた組み込みの /rewind) で巻き戻し地点 (人の発言・AskUserQuestion の質問・ほかのツール呼び出し) の
+// 一覧ペインを開く。見た目は組み込みの Rewind 画面に寄せる: 発言と質問は 1 地点 2 行 (内容と、そこから次の人の発言までに
+// 変わったファイルの要約)、選択中は ❯ と suggestion 色、最後に (現在)。ほかのツール呼び出しは続くものを 1 行に畳み、
+// その行で Enter を押すと 1 行ずつ開く (ペインでは Space を受け取れない: 打つと入力欄へ移る。2026-10-11 実機で確認)。
+// Esc 2 回は置き換えられない (本体が hook を通さずに組み込みの画面を開く)。README の Alt+R の割り当てで代わりにする。
 // キー操作はペインのフォーカスリング (矢印で移動・Enter で決定・Esc で閉じる) に任せ、
 // フォーカスの移動を ui.focus で受けてカーソルとし、その地点の AI の返答を下にプレビューする。
 // 地点を Enter で選ぶと戻し方 (AskUserQuestion なら続けて回答) を選ばせ、bin/transcript.mjs (node) で記録を切って
@@ -38,8 +45,6 @@ import {
 // Edit / Write / NotebookEdit の直前には tool.call で対象ファイルの控えを取り、ツールが実行されたかを控えに書き足す
 
 const PANE = 'better-rewind'
-// 一覧の最後の「(現在)」の key。選ぶと巻き戻さずに閉じる
-const CURRENT = 'current'
 // 枝の全文から一覧へ戻るボタンの key
 const BACK = 'back'
 // 回答を自分で書く入力欄の key
@@ -52,7 +57,7 @@ const SUMMARIZE_NOW = 'summarize:now'
 const SUMMARIZE_BACK = 'summarize:back'
 // 見出し・説明・一覧前の空行・区切り前の空行・区切り・案内前の空行・案内
 const FIXED_ROWS = 7
-// 応答の中の地点の字下げ幅
+// 字下げ 1 段の幅 (質問は 1 段、ほかのツール呼び出しは 2 段)
 const NEST = 4
 // 回答を選び直して読み直したあと、AI に続きを始めさせる一言
 // (AI には新しい回答しか見えないので「変えた」とは言わない)
@@ -64,6 +69,7 @@ const INLINE_MAX = 2.5 * 1024 * 1024
 
 const points = atom({ plugin: 'better-rewind', key: 'points' } as const, [])
 const cursor = atom({ plugin: 'better-rewind', key: 'cursor' } as const, null)
+const expanded = atom({ plugin: 'better-rewind', key: 'expanded' } as const, [])
 const status = atom({ plugin: 'better-rewind', key: 'status' } as const, '')
 const view = atom({ plugin: 'better-rewind', key: 'view' } as const, 'points')
 const picked = atom({ plugin: 'better-rewind', key: 'picked' } as const, null)
@@ -390,6 +396,30 @@ async function settleSnap($: EngineInterface, taken: Taken, file: string, ran: b
   else if (data) await node($, ['drop', sessionId, taken.toolUseId])
 }
 
+const DESCRIPTION = 'Rewind or summarize from any prompt, question or tool call'
+
+// 地点の一覧を開く。ツール呼び出しはすべて畳んだ状態から始める
+async function openPoints($: EngineInterface) {
+  await update($, cursor, () => null)
+  await update($, expanded, () => [])
+  await update($, view, () => 'points')
+  await update($, sub, () => null)
+  const list = await loadPoints($)
+  const opened = await $.ui.open({ id: PANE, title: 'Better Rewind', focus: true, closeOnEscape: true })
+  await update($, isOpen, () => true)
+  // キーボードを一覧の (現在) に置く。渡せなかったときは Tab かクリックで渡せることを案内する (理由はログへ)
+  const focused = await $.ui.focus({ requestId: PANE, key: CURRENT }).catch((err: unknown) => ({ deny: String(err) }))
+  if ('deny' in focused) $.ui.log(`better-rewind: could not move keyboard focus: ${focused.deny}`)
+  const note = 'deny' in focused ? ' (press Tab or click the list to use the keyboard there)' : ''
+  return { text: `Opened ${plural(list.length, 'rewind point')}${opened.isPlaced ? '' : ' (waiting: terminal too narrow)'}${note}` }
+}
+
+// 畳んだツール呼び出しの行で Enter: 開く・畳む。カーソルはその行に残す
+async function toggleGroup($: EngineInterface, key: string) {
+  await update($, expanded, list => (list.includes(key) ? list.filter(k => k !== key) : [...list, key]))
+  await update($, cursor, () => key)
+}
+
 async function openBranches($: EngineInterface) {
   const out = await node<{ branches: Branch[] }>($, ['branches', await $.session.id()])
   const list = out.branches ?? []
@@ -612,24 +642,15 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await update($, isRunning, () => false)
-    await $.command.register({ name: 'better-rewind', description: 'Rewind or summarize from any prompt or question', argumentHint: '[branches]' })
+    await $.command.register({ name: 'better-rewind', description: DESCRIPTION, argumentHint: '[branches]' })
     return started
   })
 
-  on('command.run', { command: 'better-rewind' }, async ($, e) => {
-    if (e.args.trim() === 'branches') return openBranches($)
-    await update($, cursor, () => null)
-    await update($, view, () => 'points')
-    await update($, sub, () => null)
-    const list = await loadPoints($)
-    const opened = await $.ui.open({ id: PANE, title: 'Better Rewind', focus: true, closeOnEscape: true })
-    await update($, isOpen, () => true)
-    // キーボードを一覧の (現在) に置く。渡せなかったときは Tab かクリックで渡せることを案内する (理由はログへ)
-    const focused = await $.ui.focus({ requestId: PANE, key: CURRENT }).catch((err: unknown) => ({ deny: String(err) }))
-    if ('deny' in focused) $.ui.log(`better-rewind: could not move keyboard focus: ${focused.deny}`)
-    const note = 'deny' in focused ? ' (press Tab or click the list to use the keyboard there)' : ''
-    return { text: `Opened ${plural(list.length, 'rewind point')}${opened.isPlaced ? '' : ' (waiting: terminal too narrow)'}${note}` }
-  })
+  on('command.run', { command: 'better-rewind' }, async ($, e) => (e.args.trim() === 'branches' ? openBranches($) : openPoints($)))
+
+  // 組み込みの /rewind (と別名) を置き換える。next を呼ばないので組み込みの画面は開かない。開けなかったときは組み込みに任せる
+  on('command.run', { command: 'rewind' }, $ => openPoints($)).catch(($, e, next) => (next.called ? { text: 'better-rewind could not open its list' } : next(e)))
+  on('command.describe', { command: 'rewind' }, ($, e, next) => next({ ...e, description: `${DESCRIPTION} (better-rewind)` })).catch(($, e, next) => next(e))
 
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) {
@@ -722,32 +743,33 @@ export const register: Register = on => {
     const note = await read($, status)
     if (list.length === 0) return <Text dimColor>{note || 'No rewind points'}</Text>
 
+    // 一覧の並び: 地点 (畳んだツール呼び出しは 1 行) のあとに (現在)。カーソルが見えている行に無ければ (現在)
+    const all = listRows(list, await read($, expanded))
     const at = await read($, cursor)
-    const found = at === null ? -1 : list.findIndex(p => pointKey(p) === at)
-    // 一覧の並び: 地点のあとに (現在)。カーソルが無ければ (現在)
-    const index = found >= 0 ? found : list.length
-    const selected = found >= 0 ? list[found] : undefined
+    const found = at === null ? -1 : all.findIndex(r => r.key === at)
+    const index = found >= 0 ? found : all.length - 1
+    const selected = all[index]
 
     const previewRows = Math.min(10, Math.max(3, Math.floor(rows * 0.3)))
-    // 1 地点 = 2 行 + 地点のあいだの空行 1 行 (組み込みと同じ間隔)
-    const visible = Math.max(1, Math.floor((rows - FIXED_ROWS - previewRows + 1) / 3))
-    const [start, end] = windowAround(index, list.length + 1, visible)
+    const [start, end] = windowRows(all, index, Math.max(1, rows - FIXED_ROWS - previewRows))
 
     const items = []
     for (let i = start; i < end; i++) {
+      const r = all[i]
+      if (!r) continue
       const isFocused = i === index
-      const p = list[i]
-      const key = p ? pointKey(p) : CURRENT
-      const c = p ? changesParts(p.changes) : undefined
-      // 人の発言 (組み込みの rewind に出る項目) を上の階層に置き、その応答の中の地点は字下げする
-      const isNested = p !== undefined && p.kind !== 'prompt'
+      const p = r.kind === 'point' ? r.point : undefined
+      const c = p && r.kind === 'point' && r.depth < 2 ? changesParts(p.changes) : undefined
+      // 人の発言 (組み込みの rewind に出る項目) を上の階層に置き、その応答の中の質問は 1 段、ほかのツール呼び出しは 2 段字下げする
+      const depth = r.kind === 'point' ? r.depth : r.kind === 'group' ? 2 : 0
+      const label = r.kind === 'group' ? `${r.isOpen ? '▾' : '▸'} ${plural(r.tools.length, 'tool call')}` : p ? `${depth === 1 ? '● ' : ''}${p.label}` : '(current)'
       items.push(
-        <Box key={`row:${key}`} flexDirection="column" marginTop={i > start ? 1 : 0} paddingLeft={isNested ? NEST : 0}>
+        <Box key={`row:${r.key}`} flexDirection="column" marginTop={i > start ? rowGap(r) : 0} paddingLeft={depth * NEST}>
           <Box flexDirection="row">
-            <Button key={key} plain label={isFocused ? '❯' : ' '} onPress={() => void choose($, p)} />
+            <Button key={r.key} plain label={isFocused ? '❯' : ' '} onPress={() => void (r.kind === 'group' ? toggleGroup($, r.key) : choose($, p))} />
             <Text> </Text>
-            <Text color={isFocused ? 'suggestion' : undefined} italic={!p || undefined} wrap="truncate-end">
-              {p ? `${p.kind === 'prompt' ? '' : '● '}${p.label}` : '(current)'}
+            <Text color={isFocused ? 'suggestion' : undefined} dimColor={(r.kind === 'group' && !isFocused) || undefined} italic={r.kind === 'current' || undefined} wrap="truncate-end">
+              {label}
             </Text>
           </Box>
           {c && (
@@ -761,6 +783,10 @@ export const register: Register = on => {
         </Box>,
       )
     }
+    // 下のプレビュー: 地点ならその後の返答、まとまりなら中のツール呼び出し
+    const preview =
+      selected?.kind === 'point' ? selected.point.reply || '(no reply)' : selected?.kind === 'group' ? selected.tools.map(t => `▸ ${t.label}`).join('\n') : 'This is the current state'
+    const isGroup = selected?.kind === 'group'
 
     return (
       <Box flexDirection="column">
@@ -772,12 +798,12 @@ export const register: Register = on => {
           {items}
         </Box>
         <Box marginTop={1}>
-          <Text dimColor>── Claude's reply from this point</Text>
+          <Text dimColor>{isGroup ? '── Tool calls in this group' : "── Claude's reply from this point"}</Text>
         </Box>
         {/* AI の返答と同じ描き方 (見出し・強調・コード)。行数は元の文で見積もって切る */}
-        <Markdown text={clipToRows(selected ? selected.reply || '(no reply)' : 'This is the current state', previewRows, columns)} />
+        <Markdown text={clipToRows(preview, previewRows, columns)} />
         <Box marginTop={1}>
-          <Text dimColor>↑↓ to select · Enter to confirm · Esc to close</Text>
+          <Text dimColor>{isGroup ? `↑↓ to select · Enter to ${selected?.kind === 'group' && selected.isOpen ? 'hide' : 'show'} tool calls · Esc to close` : '↑↓ to select · Enter to confirm · Esc to close'}</Text>
         </Box>
       </Box>
     )

@@ -260,7 +260,7 @@ export function assertCuttable(rows, plan, before = danglingToolUses(rows, leafO
   if (broken.length > 0) throw new Error('Cannot rewind here: it would leave a tool call without its result')
 }
 
-// 巻き戻し地点: 人の発言と AskUserQuestion の質問 (新しい方から POINTS_MAX 件)。各地点に、そこから次の人の発言までの
+// 巻き戻し地点: 人の発言とツール呼び出し (AskUserQuestion の質問を含む。新しい方から POINTS_MAX 件)。各地点に、そこから次の人の発言までの
 // AI の返答 (reply) と、その間に Edit/Write で変わったファイルの要約 (changes) を付ける。
 // canCut は会話を戻せるか、restorable は戻せるファイルの控えがあるか (snaps は readSnaps の結果)。
 // restore は Restore code が戻すファイル (rewind と同じ fileRestorePlan の結果。名前は先頭 RESTORE_LIST_MAX 件まで)。
@@ -301,9 +301,8 @@ export function points(rows, snaps = [], exists = undefined) {
       const message = r.message?.id ?? r.uuid
       if (toolMessages.has(message)) continue
       toolMessages.add(message)
-      // ツール呼び出しは地点にしない (一覧を発言と質問だけにする)。質問 (AskUserQuestion) だけを地点にする
-      if (b.name !== 'AskUserQuestion') continue
-      const questions = Array.isArray(b.input?.questions) ? b.input.questions : undefined
+      // 質問 (AskUserQuestion) なら回答を選び直せるように質問を付ける
+      const questions = b.name === 'AskUserQuestion' && Array.isArray(b.input?.questions) ? b.input.questions : undefined
       out.push({ uuid: r.uuid, kind: 'tool', tool: b.name, toolUseId: b.id, resultUuid: resultOf.get(b.id), label: toolLabel(b.name, b.input), questions, at: i })
     }
   })

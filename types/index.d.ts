@@ -9,7 +9,7 @@ export type Question = {
 // 巻き戻し地点。bin/transcript.mjs の points() が返す形
 export type Point = {
   uuid: string
-  // 人の発言 (prompt) か AskUserQuestion の質問 (tool)。ほかのツール呼び出しは地点にしない
+  // 人の発言 (prompt) かツール呼び出し (tool。AskUserQuestion の質問を含む)。並列の呼び出しは最初の 1 つだけ
   kind: 'prompt' | 'tool'
   label: string
   reply: string
@@ -120,8 +120,10 @@ declare module 'claude-code' {
   interface PluginState {
     'better-rewind': {
       points: Point[]
-      // カーソルのある地点の key (pointKey)。null は一覧の最後の (現在)
+      // カーソルのある行の key (地点は pointKey、畳んだツール呼び出しの行は groupKey)。null は一覧の最後の (現在)
       cursor: string | null
+      // 開いているツール呼び出しのまとまり (groupKey)。ペインを開くたびに空 (すべて畳む) に戻す
+      expanded: string[]
       // 読み込み中・失敗の一言。空なら表示しない
       status: string
       view: View
