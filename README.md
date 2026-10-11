@@ -49,12 +49,12 @@ Pressing Esc twice opens the built-in Rewind, and a mod cannot change that: Clau
 ```json
 {
   "bindings": [
-    { "context": "Chat", "bindings": { "alt+r": "command:better-rewind" } }
+    { "context": "Chat", "bindings": { "ctrl+q": "command:better-rewind" } }
   ]
 }
 ```
 
-Claude Code does not use Alt+R for anything else. Your terminal may take some keys before Claude Code sees them; if Alt+R does nothing, pick another free key, such as `ctrl+q` or `ctrl+x ctrl+r`.
+Claude Code does not use Ctrl+Q for anything else. Your terminal may take some keys before Claude Code sees them, or pass them on changed; for example, Alt+R works in some terminals but does not reach Claude Code in others. If Ctrl+Q does nothing, pick another free key, such as `alt+r` or `ctrl+x ctrl+r` (Ctrl+X, then Ctrl+R).
 
 You could bind `"escape escape"` instead, but then a single Esc no longer stops Claude while it is responding (Claude Code waits up to 3 seconds for the second Esc and drops the first). Ctrl+C still stops it.
 
@@ -147,12 +147,12 @@ Esc を 2 回押すと組み込みの Rewind が開き、これは mod からは
 ```json
 {
   "bindings": [
-    { "context": "Chat", "bindings": { "alt+r": "command:better-rewind" } }
+    { "context": "Chat", "bindings": { "ctrl+q": "command:better-rewind" } }
   ]
 }
 ```
 
-Alt+R は Claude Code のほかの機能では使われていません。端末が先にキーを使うことがあるので、Alt+R で開かなければ `ctrl+q` や `ctrl+x ctrl+r` などほかの空いているキーにしてください。
+Ctrl+Q は Claude Code のほかの機能では使われていません。端末によってはキーを先に使ったり、変えて渡したりします (例えば Alt+R は、効く端末と Claude Code まで届かない端末があります)。Ctrl+Q で開かなければ、`alt+r` や `ctrl+x ctrl+r` (Ctrl+X の後に Ctrl+R) などほかの空いているキーにしてください。
 
 `"escape escape"` に割り当てることもできますが、そうすると Claude の応答中に Esc を 1 回押しても止まらなくなります (Claude Code が 2 回目の Esc を最大 3 秒待ち、1 回目を捨てるため)。Ctrl+C では止まります。
 
